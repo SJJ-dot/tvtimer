@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f6feb">
+<title>电视管控 · 设置</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --card:#ffffff; --line:#e3e8ef; --txt:#1f2933; --sub:#6b7785;
+    --blue:#1f6feb; --blue-d:#1657c0; --red:#e5484d; --green:#2f9e44; --amber:#f08c00;
+    --radius:14px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+    background:var(--bg); color:var(--txt); line-height:1.5;
+    padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+    -webkit-text-size-adjust:100%;
+  }
+  .wrap{max-width:560px;margin:0 auto;padding:16px 14px 40px}
+  h1{font-size:20px;margin:6px 2px 14px;display:flex;align-items:center;gap:8px}
+  h1 .dot{width:10px;height:10px;border-radius:50%;background:var(--blue)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  .card h2{font-size:15px;margin:0 0 12px;color:var(--sub);font-weight:600;letter-spacing:.02em}
+  /* 状态 */
+  .status-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .stat .k{font-size:12px;color:var(--sub)}
+  .stat .v{font-size:18px;font-weight:700;margin-top:2px}
+  .badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:13px;font-weight:600}
+  .b-off{background:#eef2f6;color:var(--sub)}
+  .b-ban{background:#ffe3e3;color:var(--red)}
+  .b-watch{background:#fff3bf;color:var(--amber)}
+  .b-rest{background:#d3f9d8;color:var(--green)}
+  /* 表单 */
+  label{display:block;font-size:13px;color:var(--sub);margin:14px 0 6px}
+  label:first-of-type{margin-top:0}
+  input[type=text],input[type=number],input[type=time]{
+    width:100%;font-size:16px;padding:12px 12px;border:1px solid var(--line);
+    border-radius:10px;background:#fff;color:var(--txt);appearance:none;
+  }
+  input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(31,111,235,.15)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .win{border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:10px;background:#f8fafc}
+  .win .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .win .head span{font-size:13px;color:var(--sub)}
+  .win .times{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center}
+  .win .times .arr{color:var(--sub);font-size:14px}
+  .btn{border:none;border-radius:10px;font-size:15px;font-weight:600;padding:12px 16px;cursor:pointer}
+  .btn-blue{background:var(--blue);color:#fff;width:100%;margin-top:18px}
+  .btn-blue:active{background:var(--blue-d)}
+  .h-row{display:flex;align-items:center;justify-content:space-between}
+  .power-btn{flex:none;width:38px;height:38px;border:none;border-radius:50%;
+    background:var(--red);color:#fff;display:flex;align-items:center;justify-content:center;
+    cursor:pointer;margin:-2px 0;padding:0}
+  .power-btn:active{background:#c92a2a}
+  .power-btn:disabled{opacity:.5}
+  .power-btn svg{width:19px;height:19px}
+  .btn-ghost{background:transparent;color:var(--red);border:1px solid var(--line);padding:8px 12px;font-size:13px}
+  .btn-add{background:#eef4ff;color:var(--blue);border:1px dashed var(--blue);width:100%;margin-top:4px;padding:11px}
+  .hint{font-size:12px;color:var(--sub);margin-top:6px}
+  .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);
+    background:#1f2933;color:#fff;padding:11px 18px;border-radius:10px;font-size:14px;
+    opacity:0;transition:.25s;pointer-events:none;z-index:50;max-width:90%}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.err{background:var(--red)}
+  .toast.ok{background:var(--green)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="dot"></span>电视管控设置</h1>
+
+  <div class="card">
+    <h2 class="h-row">实时状态
+      <button class="power-btn" id="powerOff" title="关闭电视" aria-label="关闭电视">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
+        </svg>
+      </button>
+    </h2>
+    <div class="status-grid">
+      <div class="stat"><div class="k">电视状态</div><div class="v" id="s-tv">—</div></div>
+      <div class="stat"><div class="k">当前模式</div><div class="v" id="s-mode">—</div></div>
+      <div class="stat"><div class="k">净已看(抵扣后)</div><div class="v" id="s-watched">—</div></div>
+      <div class="stat"><div class="k">还可看</div><div class="v" id="s-watch">—</div></div>
+      <div class="stat" style="grid-column:1/3"><div class="k">强制休息剩余</div><div class="v" id="s-rest">—</div></div>
+    </div>
+    <div class="hint" id="s-ip"></div>
+    <div class="hint">在线时点击图标即可关机</div>
+  </div>
+
+  <div class="card">
+    <h2>基础设置</h2>
+    <label>电视局域网 IP</label>
+    <input type="text" id="tv_ip" placeholder="192.168.80.181" inputmode="text">
+    <div class="row2">
+      <div>
+        <label>单次最长观看（分钟）</label>
+        <input type="number" id="max_watch_min" min="1" inputmode="numeric">
+      </div>
+      <div>
+        <label>强制休息（分钟）</label>
+        <input type="number" id="rest_min" min="0" inputmode="numeric">
+      </div>
+    </div>
+    <label>轮询间隔（秒）</label>
+    <input type="number" id="poll_interval" min="1" inputmode="numeric">
+    <div class="hint">净观看达上限即强制关机；关后再开继续累计。</div>
+  </div>
+
+  <div class="card">
+    <h2>禁用时段（这些时间电视不准开机）</h2>
+    <div id="wins"></div>
+    <button class="btn btn-add" id="addWin">+ 添加禁用时段</button>
+    <div class="hint">例：23:00→07:00，支持跨午夜</div>
+  </div>
+
+  <button class="btn btn-blue" id="save">保存设置</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+function fmtSec(s){
+  if(s<=0) return "0";
+  const m=Math.floor(s/60), ss=s%60;
+  return m>0 ? `${m}分${ss.toString().padStart(2,'0')}秒` : `${ss}秒`;
+}
+function toast(msg, type){
+  const t=$("toast"); t.textContent=msg; t.className="toast show "+(type||"");
+  setTimeout(()=>t.className="toast "+(type||""), 1800);
+}
+
+/* ---------- 禁用时段列表 ---------- */
+function renderWindows(list){
+  const box=$("wins"); box.innerHTML="";
+  list.forEach((w,i)=>{
+    const div=document.createElement("div"); div.className="win";
+    div.innerHTML=`
+      <div class="head"><span>时段 ${i+1}</span>
+        <button class="btn btn-ghost" data-i="${i}">删除</button></div>
+      <div class="times">
+        <input type="time" value="${w[0]}" data-i="${i}" data-k="s">
+        <span class="arr">→</span>
+        <input type="time" value="${w[1]}" data-i="${i}" data-k="e">
+      </div>`;
+    box.appendChild(div);
+  });
+  box.querySelectorAll("input[type=time]").forEach(inp=>{
+    inp.addEventListener("change", e=>{
+      const i=+e.target.dataset.i, k=e.target.dataset.k;
+      cur[i][k==="s"?0:1]=e.target.value;
+    });
+  });
+  box.querySelectorAll(".btn-ghost").forEach(b=>{
+    b.addEventListener("click", e=>{ cur.splice(+e.target.dataset.i,1); renderWindows(cur); });
+  });
+}
+let cur=[];
+
+/* ---------- 加载配置 ---------- */
+async function load(){
+  try{
+    const r=await fetch("/config"); const c=await r.json();
+    $("tv_ip").value=c.tv_ip||"";
+    $("max_watch_min").value=c.max_watch_min??30;
+    $("rest_min").value=c.rest_min??40;
+    $("poll_interval").value=c.poll_interval??5;
+    cur=(c.disabled_windows||[]).map(w=>[w[0],w[1]]);
+    renderWindows(cur);
+  }catch(e){ toast("加载配置失败", "err"); }
+}
+
+/* ---------- 保存配置 ---------- */
+$("save").addEventListener("click", async ()=>{
+  const payload={
+    tv_ip:$("tv_ip").value.trim(),
+    max_watch_min:parseInt($("max_watch_min").value)||30,
+    rest_min:parseInt($("rest_min").value)||0,
+    poll_interval:parseInt($("poll_interval").value)||5,
+    disabled_windows:cur.map(w=>[w[0],w[1]])
+  };
+  if(!payload.tv_ip){ toast("请填写电视 IP", "err"); return; }
+  try{
+    const r=await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)});
+    const j=await r.json();
+    if(j.ok){ toast("已保存", "ok"); }
+    else{ toast("保存失败: "+(j.error||""), "err"); }
+  }catch(e){ toast("保存失败", "err"); }
+});
+$("addWin").addEventListener("click", ()=>{ cur.push(["22:00","07:00"]); renderWindows(cur); });
+
+/* ---------- 手动关闭电视 ---------- */
+$("powerOff").addEventListener("click", async ()=>{
+  const btn=$("powerOff"); btn.disabled=true;
+  try{
+    const r=await fetch("/power_off",{method:"POST"});
+    const j=await r.json();
+    if(j.ok){ toast("已发送关机指令", "ok"); }
+    else{ toast(j.message||"关机失败", "err"); }
+  }catch(e){ toast("请求失败", "err"); }
+  finally{ setTimeout(()=>btn.disabled=false, 3000); }
+});
+
+/* ---------- 状态轮询 ---------- */
+function modeBadge(s){
+  switch(s.mode){
+    case "disabled": return ["禁用时段", "b-ban"];
+    case "resting":  return ["强制休息中", "b-rest"];
+    case "watching": return ["观看中", "b-watch"];
+    default:         return ["空闲", "b-off"];
+  }
+}
+async function poll(){
+  try{
+    const r=await fetch("/status"); const s=await r.json();
+    const [mt,mc]=modeBadge(s);
+    const online = (s.mode==="watching");
+    $("s-tv").innerHTML = `<span class="badge ${online?'b-watch':'b-off'}">${online?'在线':'离线'}</span>`;
+    $("s-mode").innerHTML=`<span class="badge ${mc}">${mt}</span>`;
+    $("s-watched").textContent = (s.net_watched_min!=null)? `${s.net_watched_min} 分` : "—";
+    $("s-watch").textContent = s.watch_remaining_sec>0? fmtSec(s.watch_remaining_sec) : (s.mode==="watching"?"已满":"—");
+    $("s-rest").textContent = s.rest_remaining_sec>0? fmtSec(s.rest_remaining_sec) : "—";
+    $("s-ip").textContent="电视 "+(s.tv_ip||"")+(s.disabled_now?" · 禁用时段":"");
+  }catch(e){}
+}
+load();
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

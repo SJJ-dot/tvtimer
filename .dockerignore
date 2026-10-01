@@ -1,0 +1,11 @@
+# 不纳入镜像的文件
+.git
+.gitignore
+*.md
+.github
+__pycache__
+*.pyc
+tv_control_config.json
+data
+venv
+.env
