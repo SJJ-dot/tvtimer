@@ -252,6 +252,10 @@ class TvGuard:
                         if delta > 0:
                             self.rest_credit_min += delta * self._ratio()
                         self.last_off_ts = now
+                    # 休息抵扣不能超过已观看量：否则长期离线会把净已看一直压在 0，
+                    # 导致恢复观看时「净已看/还可看」长时间不动（看似不计时）。
+                    if self.rest_credit_min > self.watched_gross_min:
+                        self.rest_credit_min = self.watched_gross_min
                     self.last_on_ts = None
 
     def snapshot(self):
