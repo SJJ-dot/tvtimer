@@ -20,6 +20,11 @@ M.in_disabled_window = lambda ts: disabled_flag[0]
 
 g = M.guard
 
+# 关闭每日次数/总时长上限，避免干扰本文件的「净观看模型」测试
+M.CONFIG["weekday_sessions"] = 99
+M.CONFIG["weekend_sessions"] = 99
+M.CONFIG["daily_total_min"] = 0
+
 
 def reset():
     g.__init__()
