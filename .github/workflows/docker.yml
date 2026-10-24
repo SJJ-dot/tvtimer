@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: '镜像版本（如 1.2.3 或 v1.2.3；留空则只推 main 标签）'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -33,20 +38,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            # tag 触发（如 v1.2.3）-> 语义化版本标签
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            # 最新一个 tag -> latest（与 mysubconvert 一致：latest = 最新 release）
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-            # 非 tag 触发（手动 dispatch）-> 推 main 标签，避免空 tags 导致 buildx 失败
-            type=raw,value=main,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+      # tag 触发 -> 从 ref 取版本；手动触发 -> 取输入的版本号。
+      # 生成 tags: V / major.minor / major / latest；无版本时回退 main。
+      - name: 计算镜像标签
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            V="${GITHUB_REF#refs/tags/}"; V="${V#v}"
+          else
+            V="${{ github.event.inputs.version }}"; V="${V#v}"
+          fi
+          if [ -z "$V" ]; then
+            echo "tags=${IMAGE}:main" >> "$GITHUB_OUTPUT"
+            echo "version=main" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$V" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+            echo "::error::版本格式非法: '$V'（应为 1.2.3 / 1.2 / 1）"
+            exit 1
+          fi
+          MM="${V%.*}"
+          M="${V%%.*}"
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE}:${V}"
+            if [ "$MM" != "$V" ]; then echo "${IMAGE}:${MM}"; fi
+            if [ "$M" != "$V" ]; then echo "${IMAGE}:${M}"; fi
+            echo "${IMAGE}:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -54,7 +75,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.ver.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
