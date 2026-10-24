@@ -15,9 +15,6 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/tv-control
-
 jobs:
   docker:
     runs-on: ubuntu-latest
@@ -40,9 +37,12 @@ jobs:
 
       # tag 触发 -> 从 ref 取版本；手动触发 -> 取输入的版本号。
       # 生成 tags: V / major.minor / major / latest；无版本时回退 main。
+      # 注意：镜像名必须全小写（owner 可能含大写，如 SJJ-dot -> sjj-dot）
       - name: 计算镜像标签
         id: ver
         run: |
+          IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')/tv-control"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             V="${GITHUB_REF#refs/tags/}"; V="${V#v}"
           else
