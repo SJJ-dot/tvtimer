@@ -492,8 +492,8 @@ MANIFEST = {
 }
 
 SW_JS = """\
-const CACHE = "tvtimer-v1";
-const SHELL = ["/", "/tv_control.html", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "tvtimer-v2";
+const SHELL = ["/manifest.webmanifest", "/icon.svg"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL).catch(() => {})).then(() => self.skipWaiting()));
 });
@@ -503,8 +503,9 @@ self.addEventListener("activate", e => {
 self.addEventListener("fetch", e => {
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin) return;
-  // 实时数据走网络，不参与缓存
-  if (url.pathname === "/status" || url.pathname === "/config") return;
+  // 页面与数据始终走网络，保证更新即时生效；仅静态资源参与缓存
+  if (url.pathname === "/tv_control.html" || url.pathname === "/" || url.pathname === "/index.html"
+      || url.pathname === "/status" || url.pathname === "/config") return;
   e.respondWith(
     caches.match(e.request).then(r =>
       r || fetch(e.request).then(resp => {
