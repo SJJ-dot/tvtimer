@@ -11,14 +11,14 @@
      跨「关一下再开」不会清零，因此「看20→关1→又看」无法凭空多放时间（防卡 BUG）。
   3) 强制休息时长：强制关机后须休息指定时长（如 40 分钟）才能再开机，
      休息期间被发现开机同样自动关机。可手动「重置休息」立即清零抵扣、立即可看。
-  4) 每日时间额度：工作日/周末分别设「每天可看几次」，次数=时间——N 次 × 单次X分钟 = 当天可看总时长，
-     只按实际观看时间计（与开关机次数无关），达额度当天封禁，次日自动恢复。
-  5) 每日总时长上限：与时间额度取更严者；0=不限制。
+  4) 每日总时长：工作日/休息日分别设「每天可看总时长（分钟）」，只按实际观看时间计
+     （与开关机次数无关），达额度当天封禁，次日自动恢复；0 = 不限制。
+     工作日/休息日按法定节假日判定（holiday-cn 数据，每月自动更新，离线回退星期几）。
 
 网页:
   脚本同时提供 HTTP 服务，浏览器打开 http://<本机IP>:<port>/ 即可：
     - 可视化设置以上参数（手机适配）
-    - 实时查看电视状态（禁用中 / 观看剩余 / 休息剩余 / 今日次数 / 今日总时长）
+    - 实时查看电视状态（禁用中 / 观看剩余 / 休息剩余 / 今日已看时长）
     - 支持「安装到桌面」（PWA：manifest + service worker）
   配置保存在同目录 tv_control_config.json（容器用 DATA_DIR 指向挂载卷），重启后自动加载。
 
@@ -47,9 +47,8 @@ CONFIG = {
     "poll_interval": 5,
     "max_watch_min": 30,
     "rest_min": 40,
-    "weekday_sessions": 2,     # 工作日（周一~周五）每天最多看几次
-    "weekend_sessions": 4,     # 周末（周六、周日）每天最多看几次
-    "daily_total_min": 0,      # 每天累计观看（毛）分钟上限；0 = 不限制
+    "weekday_total_min": 60,   # 工作日（周一~五）每天可看总时长（毛分钟）；0 = 不限制
+    "weekend_total_min": 120,  # 周末（六、日）每天可看总时长（毛分钟）；0 = 不限制
     "off_cooldown_sec": 10,
     "disabled_windows": [
         ["23:00", "07:00"],
@@ -67,7 +66,7 @@ HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tv_control
 config_lock = threading.Lock()
 
 ALLOWED_KEYS = {"tv_ip", "tv_port", "poll_interval", "max_watch_min", "rest_min",
-                "weekday_sessions", "weekend_sessions", "daily_total_min", "disabled_windows"}
+                "weekday_total_min", "weekend_total_min", "disabled_windows"}
 
 
 def load_config():
@@ -160,14 +159,87 @@ def in_disabled_window(now_ts):
 
 
 def is_weekday(now_ts):
-    # tm_wday: 0=周一 ... 6=周日
+    """今天是否按「工作日」额度计（法定节假日/调休感知）。
+
+    数据源：holiday-cn（github.com/NateScarlet/holiday-cn，国务院放假安排整理），
+    每月拉取一次缓存到 DATA_DIR/holiday_cn_<年>.json；拉取失败用旧缓存；
+    无任何数据时回退为「周一~周五=工作日」的星期几判断。
+    """
+    d = time.strftime("%Y-%m-%d", time.localtime(now_ts))
+    with _holiday_lock:
+        off = _holiday_offdays.get(d)
+    if off is not None:
+        return not off          # 法定假日(OffDay)=休息日额度；调休补班的周末=工作日额度
     return time.localtime(now_ts).tm_wday < 5
+
+
+# ---------- holiday-cn 节假日数据：每月拉取 + 本地缓存 ----------
+HOLIDAY_REFRESH_SEC = 30 * 86400   # 每 30 天拉取一次
+_holiday_lock = threading.Lock()
+_holiday_offdays = {}              # "YYYY-MM-DD" -> True(休息日) / False(调休补班日)；普通日期不在表内
+_holiday_last_fetch = 0.0
+
+
+def _holiday_load_file(year):
+    """把已下载的年度 JSON 读进内存表，返回是否成功。"""
+    path = os.path.join(DATA_DIR, f"holiday_cn_{year}.json")
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            days = json.load(f)["days"]
+        with _holiday_lock:
+            for it in days:
+                # isOffDay=True 休息日；False 调休补班日
+                _holiday_offdays[it["date"]] = bool(it["isOffDay"])
+        return True
+    except Exception as e:
+        print(f"[holiday] 读取 {path} 失败: {e}")
+        return False
+
+
+def _holiday_refresh():
+    """按需拉取当年（12 月顺带预取次年）节假日数据，成功后写缓存文件。"""
+    global _holiday_last_fetch
+    year = time.localtime().tm_year
+    years = [year] + ([year + 1] if time.localtime().tm_mon == 12 else [])
+    got_any = False
+    for y in years:
+        if _holiday_load_file(y) and os.path.getmtime(os.path.join(DATA_DIR, f"holiday_cn_{y}.json")) > time.time() - HOLIDAY_REFRESH_SEC:
+            got_any = True          # 本地缓存足够新，不联网
+            continue
+        url = f"https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{y}.json"
+        ok, body = _http_get(url)
+        if ok and body:
+            try:
+                days = json.loads(body)["days"]
+                path = os.path.join(DATA_DIR, f"holiday_cn_{y}.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({"days": days}, f, ensure_ascii=False)
+                _holiday_load_file(y)
+                got_any = True
+                print(f"[holiday] 已更新 {y} 年节假日数据 ({len(days)} 天)")
+            except Exception as e:
+                print(f"[holiday] 解析/保存失败 ({url}): {e}")
+        else:
+            print(f"[holiday] 拉取失败 ({url})，沿用现有数据")
+    if got_any:
+        _holiday_last_fetch = time.time()
+
+
+def holiday_refresh_loop():
+    # 启动先刷一次（有新缓存就秒回），之后每小时检查是否到 30 天刷新点
+    _holiday_refresh()
+    while True:
+        time.sleep(3600)
+        if time.time() - _holiday_last_fetch >= HOLIDAY_REFRESH_SEC:
+            _holiday_refresh()
 
 
 # ============================ 状态机 ============================
 class TvGuard:
     """
-    观看时长「按净时长累计 + 每日次数/总时长」模型：
+    观看时长「按净时长累计 + 每日总时长」模型：
       - watched_gross_min : 今日累计观看分钟（毛，只增不减，跨天重置）
       - rest_credit_min  : 今日累计「休息抵扣」分钟 = 离线时长 × 抵扣比例
       - 抵扣比例 RATIO = max_watch_min / rest_min
@@ -175,18 +247,17 @@ class TvGuard:
       - 净已看 net = clamp(watched_gross_min - rest_credit_min, 0, max_watch_min)
       - 电视开机时，已看就按 net 计；net 达到上限即强制关机并进入休息。
       - 防卡 BUG：看 20 分钟、关 1 分钟、又看，关的 1 分钟只抵扣 0.75 分钟，无法凭空多放时间。
-      - 每日时间额度（次数=时间）：工作日 weekday_sessions 次 × 单次X分钟 = 当天可看总时长（毛）；
-        周末同理由 weekend_sessions 决定。只按实际观看时间计，与开关机次数无关
-        （网络抖动/探测误判不会误扣额度）。达额度当天封禁（total_blocked），次日重置。
-      - 每日总时长上限 daily_total_min：显式设置时与时间额度取更严者；0=不限制。
+      - 每日总时长：工作日 weekday_total_min / 休息日 weekend_total_min（毛分钟，0=不限）。
+        只按实际观看时间计，与开关机次数无关（网络抖动/探测误判不会误扣额度）。
+        达额度当天封禁（total_blocked），次日重置。
       - 禁用时段内强制关机，且禁用时段不计休息抵扣（属惩罚，不算恢复）。
       - 「重置休息」：把休息抵扣顶满（net→0）、清掉强制休息闸门，立即可看；
-        不解除「当日时间额度封禁」（当天额度是硬上限，次日自动恢复）。
+        不解除「当日总时长封禁」（当天额度是硬上限，次日自动恢复）。
       - 每天本地零点重置（day_key 变更）。
     """
 
     OFFLINE_CONFIRM = 2           # 连续离线达到此次数才正式计为「离线/休息」（抗网络抖动）
-    MIN_SESSION_GAP = 30.0        # 两次开机间隔小于此秒数视为「同一片段短暂中断」，不计入次数
+    MIN_SESSION_GAP = 30.0        # 两次开机间隔小于此秒数视为「同一片段短暂中断」，不重新起算
 
     def _min_session_gap(self):
         # 轮询间隔较大时按 3 倍轮询间隔放宽，避免短暂开关机被误判为新片段
@@ -195,8 +266,7 @@ class TvGuard:
     def __init__(self):
         self.watched_gross_min = 0.0   # 今日累计观看（毛）
         self.rest_credit_min = 0.0     # 今日累计休息抵扣
-        self.sessions_today = 0       # 今日观看段数（仅展示统计，不参与封禁）
-        self.total_blocked = False     # 今日时间额度已用完（重置不解除，次日自动恢复）
+        self.total_blocked = False     # 今日总时长已用完（重置不解除，次日自动恢复）
         self.last_on_ts = None        # 上一次确认电视在线且可观看的时间戳（累加观看用）
         self.last_view_end_ts = 0.0    # 上一次观看结束（电视离线）时间戳，用于判定是否为新一次
         self.last_off_ts = None       # 上一次确认电视离线的时间戳（累加抵扣用）
@@ -217,15 +287,9 @@ class TvGuard:
         return max(0.0, min(mx, self.watched_gross_min - self.rest_credit_min))
 
     def _daily_cap(self, now_ts):
-        # 当日总观看额度（毛分钟）：次数=时间，N 次 × 单次X分钟；
-        # daily_total_min 显式设置时取两者中更严的；均未设置(0) = 不限
-        caps = []
-        n = CONFIG["weekday_sessions"] if is_weekday(now_ts) else CONFIG["weekend_sessions"]
-        if n > 0:
-            caps.append(n * CONFIG["max_watch_min"])
-        if CONFIG["daily_total_min"] > 0:
-            caps.append(CONFIG["daily_total_min"])
-        return min(caps) if caps else 0
+        # 当日可看总时长（毛分钟）：工作日/休息日分别设置（法定节假日/调休感知，见 is_weekday）；0 = 不限
+        cap = CONFIG["weekday_total_min"] if is_weekday(now_ts) else CONFIG["weekend_total_min"]
+        return cap if cap > 0 else 0
 
     def _try_off(self, reason):
         now = time.time()
@@ -238,17 +302,16 @@ class TvGuard:
 
     def reset_rest(self):
         # 把休息抵扣顶满 -> 净已看归零；清掉强制休息闸门，立即可看。
-        # 不解除「当日时间额度封禁」（total_blocked）：当天额度是硬上限，次日自动恢复。
+        # 不解除「当日总时长封禁」（total_blocked）：当天额度是硬上限，次日自动恢复。
         with self.lock:
             self.rest_credit_min = self.watched_gross_min
             self.rest_until = 0.0
-            self.sessions_today = 0
             self.last_on_ts = None
             self.last_view_end_ts = 0.0
             self.last_off_ts = None
             self.offline_count = 0
             self.last_action = "手动重置(休息)"
-        print(f"[{logts()}] 已重置（净已看归零，可立即可看；当日时间额度仍累计）")
+        print(f"[{logts()}] 已重置（净已看归零，可立即可看；当日总时长仍累计）")
 
     def tick(self):
         now = time.time()
@@ -261,14 +324,13 @@ class TvGuard:
             self.cycle_day_key = day_key
             self.watched_gross_min = 0.0
             self.rest_credit_min = 0.0
-            self.sessions_today = 0
             self.total_blocked = False
             self.last_on_ts = None
             self.last_view_end_ts = 0.0
             self.last_off_ts = None
             self.rest_until = 0.0
             self.offline_count = 0
-            print(f"[{logts()}] 跨天，今日观看/时间额度已重置")
+            print(f"[{logts()}] 跨天，今日观看/总时长已重置")
 
         with self.lock:
             if disabled:
@@ -290,12 +352,12 @@ class TvGuard:
                 if starting:
                     is_new = (self.last_view_end_ts == 0.0) or (now - self.last_view_end_ts >= self._min_session_gap())
                     if is_new:
-                        # 当日时间额度检查（先于净已看检查，额度是更严的上限）：
+                        # 当日总时长检查（先于净已看检查，额度是更严的上限）：
                         # 毛观看达上限 -> 当天封禁（只按时间计，与开关机次数无关）
                         cap = self._daily_cap(now)
                         if cap > 0 and self.watched_gross_min >= cap:
                             self.total_blocked = True
-                            self._try_off(f"今日{cap}分钟额度已用完")
+                            self._try_off(f"今日{cap}分钟已看完")
                             self.last_on_ts = None
                             return
                         # 净已看仍顶格（如强制休息期间电视一直没真正关掉、抵扣为零）
@@ -305,9 +367,7 @@ class TvGuard:
                             self.rest_until = now + CONFIG["rest_min"] * 60
                             self.last_on_ts = None
                             return
-                        self.sessions_today += 1   # 仅展示统计
-                        print(f"[{logts()}] 开始第 {self.sessions_today} 段观看 (今日额度 "
-                              f"{self._daily_cap(now) or '不限'} 分钟)")
+                        print(f"[{logts()}] 开始观看 (今日额度 {self._daily_cap(now) or '不限'} 分钟)")
                         self.rest_until = 0.0
                         self.last_on_ts = now
                     else:
@@ -321,11 +381,11 @@ class TvGuard:
                         self.watched_gross_min += delta
                     self.last_on_ts = now
 
-                # 当日时间额度达上限 -> 关且今日封禁（先于净已看检查）
+                # 当日总时长达上限 -> 关且今日封禁（先于净已看检查）
                 cap = self._daily_cap(now)
                 if cap > 0 and self.watched_gross_min >= cap:
                     self.total_blocked = True
-                    self._try_off(f"今日{cap}分钟额度已用完")
+                    self._try_off(f"今日{cap}分钟已看完")
                     self.last_on_ts = None
                     return
                 # 本次净已看达上限 -> 强制关机并进入休息
@@ -382,12 +442,12 @@ class TvGuard:
                 mode = "resting"      # 离线且在恢复抵扣
             else:
                 mode = "idle"
-            limit = CONFIG["weekday_sessions"] if is_weekday(now) else CONFIG["weekend_sessions"]
             daily_cap = self._daily_cap(now)
             remaining_cycle = max(0.0, mx - net)
         return {
             "tv_ip": CONFIG["tv_ip"],
             "disabled_now": disabled,
+            "workday_today": is_weekday(now),
             "mode": mode,
             "net_watched_min": round(net, 1),
             "watched_gross_min": round(self.watched_gross_min, 1),
@@ -400,15 +460,11 @@ class TvGuard:
             "rest_min": CONFIG["rest_min"],
             "disabled_windows": CONFIG["disabled_windows"],
             "last_action": self.last_action,
-            "sessions_today": self.sessions_today,
-            "session_limit": limit,
             "daily_cap_min": daily_cap,
-            "daily_total_min": CONFIG["daily_total_min"],
             "daily_gross_min": round(self.watched_gross_min, 1),
             "daily_remaining_min": (round(max(0.0, daily_cap - self.watched_gross_min), 1)
                                     if daily_cap > 0 else None),
             "daily_blocked": self.total_blocked,
-            "total_blocked": self.total_blocked,
         }
 
 
@@ -423,7 +479,7 @@ guard = TvGuard()
 MANIFEST = {
     "name": "电视管控",
     "short_name": "电视管控",
-    "description": "小米电视家长控制：观看时长、禁用时段、每日次数",
+    "description": "小米电视家长控制：观看时长、禁用时段、每日总时长",
     "start_url": "/",
     "scope": "/",
     "display": "standalone",
@@ -549,12 +605,10 @@ class Handler(BaseHTTPRequestHandler):
                     vals["max_watch_min"] = max(1, int(data["max_watch_min"]))
                 if "rest_min" in data:
                     vals["rest_min"] = max(0, int(data["rest_min"]))
-                if "weekday_sessions" in data:
-                    vals["weekday_sessions"] = max(0, int(data["weekday_sessions"]))
-                if "weekend_sessions" in data:
-                    vals["weekend_sessions"] = max(0, int(data["weekend_sessions"]))
-                if "daily_total_min" in data:
-                    vals["daily_total_min"] = max(0, int(data["daily_total_min"]))
+                if "weekday_total_min" in data:
+                    vals["weekday_total_min"] = max(0, int(data["weekday_total_min"]))
+                if "weekend_total_min" in data:
+                    vals["weekend_total_min"] = max(0, int(data["weekend_total_min"]))
                 if "disabled_windows" in data:
                     wins = []
                     for w in data["disabled_windows"]:
@@ -591,7 +645,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, 500)
         elif path == "/reset_rest":
-            # 手动重置休息：净已看归零、清强制休息闸门，立即可看；不解除当日时间额度封禁
+            # 手动重置休息：净已看归零、清强制休息闸门，立即可看；不解除当日总时长封禁
             guard.reset_rest()
             self._send_json({"ok": True, "message": "已重置休息，可立即可看"})
         else:
@@ -604,9 +658,7 @@ class Handler(BaseHTTPRequestHandler):
 def monitor_loop():
     print(f"[{logts()}] 监控启动: TV={CONFIG['tv_ip']}:{CONFIG['tv_port']} "
           f"最长观看={CONFIG['max_watch_min']}min 休息={CONFIG['rest_min']}min "
-          f"每日额度(工作日/周末)={CONFIG['weekday_sessions']}×{CONFIG['max_watch_min']}/"
-          f"{CONFIG['weekend_sessions']}×{CONFIG['max_watch_min']}min "
-          f"每日总时长上限={CONFIG['daily_total_min']}min "
+          f"每日总时长(工作日/休息日)={CONFIG['weekday_total_min']}/{CONFIG['weekend_total_min']}min "
           f"禁用时段={CONFIG['disabled_windows']} 轮询={CONFIG['poll_interval']}s")
     while True:
         try:
@@ -625,6 +677,7 @@ def main():
     args = ap.parse_args()
 
     threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=holiday_refresh_loop, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[{logts()}] 网页/接口: http://{args.host}:{args.port}/  (手机浏览器打开即可，可安装到桌面)")
     try:

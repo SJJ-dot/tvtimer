@@ -2,3 +2,4 @@ tv_control_config.json
 __pycache__/
 *.pyc
 data/
+holiday_cn_*.json

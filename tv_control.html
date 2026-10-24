@@ -91,9 +91,7 @@
       <div class="stat"><div class="k">当前模式</div><div class="v" id="s-mode">—</div></div>
       <div class="stat"><div class="k">净已看(抵扣后)</div><div class="v" id="s-watched">—</div></div>
       <div class="stat"><div class="k">还可看</div><div class="v" id="s-watch">—</div></div>
-      <div class="stat"><div class="k">今日次数</div><div class="v" id="s-sess">—</div></div>
-      <div class="stat"><div class="k">今日已看时间</div><div class="v" id="s-daily">—</div></div>
-      <div class="stat" style="grid-column:1/3"><div class="k">强制休息剩余</div><div class="v" id="s-rest">—</div></div>
+      <div class="stat" style="grid-column:1/3"><div class="k">今日已看时间</div><div class="v" id="s-daily">—</div></div>
     </div>
     <div class="hint" id="s-ip"></div>
     <div class="row2" style="margin-top:10px">
@@ -125,20 +123,18 @@
   </div>
 
   <div class="card">
-    <h2>每日时间额度（次数=时间）</h2>
+    <h2>每日可看总时长（分钟）</h2>
     <div class="row2">
       <div>
-        <label>工作日次数（周一~五）</label>
-        <input type="number" id="weekday_sessions" min="0" inputmode="numeric">
+        <label>工作日（周一~五）</label>
+        <input type="number" id="weekday_total_min" min="0" inputmode="numeric">
       </div>
       <div>
-        <label>周末次数（六、日）</label>
-        <input type="number" id="weekend_sessions" min="0" inputmode="numeric">
+        <label>休息日（六、日）</label>
+        <input type="number" id="weekend_total_min" min="0" inputmode="numeric">
       </div>
     </div>
-    <label>每日总时长上限（分钟，0=不限制）</label>
-    <input type="number" id="daily_total_min" min="0" inputmode="numeric">
-    <div class="hint">次数=时间额度：N 次 × 单次X分钟 = 当天可看总时长，只按实际观看时间计，与开关机次数无关。0=不限。与下方总时长上限同时生效时取更严者。</div>
+    <div class="hint">每天可看的总时长，只按实际观看时间计，与开关机次数无关。达上限当天不可再看，次日恢复。0=不限制。</div>
   </div>
 
   <div class="card">
@@ -200,9 +196,8 @@ async function load(){
     $("max_watch_min").value=c.max_watch_min??30;
     $("rest_min").value=c.rest_min??40;
     $("poll_interval").value=c.poll_interval??5;
-    $("weekday_sessions").value=c.weekday_sessions??2;
-    $("weekend_sessions").value=c.weekend_sessions??4;
-    $("daily_total_min").value=c.daily_total_min??0;
+    $("weekday_total_min").value=c.weekday_total_min??60;
+    $("weekend_total_min").value=c.weekend_total_min??120;
     cur=(c.disabled_windows||[]).map(w=>[w[0],w[1]]);
     renderWindows(cur);
   }catch(e){ toast("加载配置失败", "err"); }
@@ -215,9 +210,8 @@ $("save").addEventListener("click", async ()=>{
     max_watch_min:parseInt($("max_watch_min").value)||30,
     rest_min:parseInt($("rest_min").value)||0,
     poll_interval:parseInt($("poll_interval").value)||5,
-    weekday_sessions:parseInt($("weekday_sessions").value)||0,
-    weekend_sessions:parseInt($("weekend_sessions").value)||0,
-    daily_total_min:parseInt($("daily_total_min").value)||0,
+    weekday_total_min:parseInt($("weekday_total_min").value)||0,
+    weekend_total_min:parseInt($("weekend_total_min").value)||0,
     disabled_windows:cur.map(w=>[w[0],w[1]])
   };
   if(!payload.tv_ip){ toast("请填写电视 IP", "err"); return; }
@@ -231,7 +225,7 @@ $("save").addEventListener("click", async ()=>{
 });
 $("addWin").addEventListener("click", ()=>{ cur.push(["22:00","07:00"]); renderWindows(cur); });
 
-/* ---------- 重置休息（立即可看；当日时间额度不解除） ---------- */
+/* ---------- 重置休息（立即可看；当日总时长不解除） ---------- */
 $("resetRest").addEventListener("click", async ()=>{
   const btn=$("resetRest"); btn.disabled=true;
   try{
@@ -284,7 +278,7 @@ function modeBadge(s){
   switch(s.mode){
     case "disabled": return ["禁用时段", "b-ban"];
     case "blocked":  return ["今日已达上限", "b-ban"];
-    case "resting":  return ["强制休息中", "b-rest"];
+    case "resting":  return ["强制休息中"+(s.rest_remaining_sec>0?` · 剩 ${fmtSec(s.rest_remaining_sec)}`:""), "b-rest"];
     case "watching": return ["观看中", "b-watch"];
     default:         return ["空闲", "b-off"];
   }
@@ -298,12 +292,12 @@ async function poll(){
     $("s-mode").innerHTML=`<span class="badge ${mc}">${mt}</span>`;
     $("s-watched").textContent = (s.net_watched_min!=null)? `${s.net_watched_min} 分` : "—";
     $("s-watch").textContent = s.watch_remaining_sec>0? fmtSec(s.watch_remaining_sec) : (s.mode==="watching"?"已满":"—");
-    $("s-sess").textContent = (s.sessions_today!=null)? `${s.sessions_today} / ${s.session_limit}` : "—";
     $("s-daily").textContent = (s.daily_cap_min>0)
       ? `${s.daily_gross_min} / ${s.daily_cap_min} 分`
       : `${s.daily_gross_min} 分`;
-    $("s-rest").textContent = s.rest_remaining_sec>0? fmtSec(s.rest_remaining_sec) : "—";
-    $("s-ip").textContent="电视 "+(s.tv_ip||"")+(s.disabled_now?" · 禁用时段":"");
+    $("s-ip").textContent="电视 "+(s.tv_ip||"")
+      +(s.disabled_now?" · 禁用时段":"")
+      +(s.workday_today!=null?` · 今日按${s.workday_today?"工作日":"休息日"}额度`:"");
   }catch(e){}
 }
 load();
