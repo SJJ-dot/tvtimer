@@ -62,6 +62,7 @@ CONFIG = {
 # 配置落盘目录：容器场景可用环境变量 DATA_DIR 指向挂载卷（如 /app/data），实现配置持久化
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(DATA_DIR, "tv_control_config.json")
+STATE_PATH = os.path.join(DATA_DIR, "guard_state.json")
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tv_control.html")
 config_lock = threading.Lock()
 
@@ -276,6 +277,55 @@ class TvGuard:
         self.cycle_day_key = time.strftime("%Y-%m-%d")
         self.lock = threading.Lock()
         self.last_action = "idle"
+        self._last_save = 0.0
+
+    # ---------- 观看状态持久化（升级/重启不丢当天观看时长） ----------
+    def save_state(self):
+        try:
+            with self.lock:
+                st = {
+                    "cycle_day_key": self.cycle_day_key,
+                    "watched_gross_min": self.watched_gross_min,
+                    "rest_credit_min": self.rest_credit_min,
+                    "total_blocked": self.total_blocked,
+                    "rest_until": self.rest_until,
+                    "last_view_end_ts": self.last_view_end_ts,
+                }
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(st, f)
+            os.replace(tmp, STATE_PATH)   # 原子替换，避免写一半损坏
+        except Exception as e:
+            print(f"[state] 保存观看状态失败: {e}")
+
+    def maybe_save_state(self, min_interval=30.0):
+        # 节流：至少间隔 min_interval 秒才写一次盘，减少闪存磨损
+        if time.time() - self._last_save >= min_interval:
+            self._last_save = time.time()
+            self.save_state()
+
+    def load_state(self):
+        if not os.path.exists(STATE_PATH):
+            return
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            if st.get("cycle_day_key") != time.strftime("%Y-%m-%d"):
+                print("[state] 状态文件是旧一天的，忽略")
+                return
+            with self.lock:
+                self.cycle_day_key = st["cycle_day_key"]
+                self.watched_gross_min = max(0.0, float(st.get("watched_gross_min", 0.0)))
+                self.rest_credit_min = max(0.0, float(st.get("rest_credit_min", 0.0)))
+                self.total_blocked = bool(st.get("total_blocked", False))
+                self.rest_until = float(st.get("rest_until", 0.0))
+                self.last_view_end_ts = float(st.get("last_view_end_ts", 0.0))
+            print(f"[state] 已恢复今日观看状态: 毛观看 {self.watched_gross_min:.1f} 分, "
+                  f"抵扣 {self.rest_credit_min:.1f} 分"
+                  + (f", 强制休息至 {time.strftime('%H:%M:%S', time.localtime(self.rest_until))}"
+                     if self.rest_until > time.time() else ""))
+        except Exception as e:
+            print(f"[state] 读取观看状态失败(忽略): {e}")
 
     @staticmethod
     def _ratio():
@@ -439,7 +489,7 @@ class TvGuard:
             elif self.last_on_ts is not None:
                 mode = "watching"
             elif net > 0:
-                mode = "resting"      # 离线且在恢复抵扣
+                mode = "recovering"   # 离线休息抵扣中（非强制闸门，随时可打开电视）
             else:
                 mode = "idle"
             daily_cap = self._daily_cap(now)
@@ -664,6 +714,7 @@ def monitor_loop():
     while True:
         try:
             guard.tick()
+            guard.maybe_save_state()
         except Exception as e:
             print(f"[{logts()}] tick error: {e}")
         time.sleep(CONFIG["poll_interval"])
@@ -672,6 +723,7 @@ def monitor_loop():
 def main():
     load_config()
     refresh_urls()
+    guard.load_state()   # 恢复今日观看时长（升级/重启不丢）
     ap = argparse.ArgumentParser(description="小米电视管控脚本 + 配置网页")
     ap.add_argument("--host", default=CONFIG["http_host"])
     ap.add_argument("--port", type=int, default=CONFIG["http_port"])

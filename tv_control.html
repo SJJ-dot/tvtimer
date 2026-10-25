@@ -276,11 +276,12 @@ $("powerOff").addEventListener("click", async ()=>{
 /* ---------- 状态轮询 ---------- */
 function modeBadge(s){
   switch(s.mode){
-    case "disabled": return ["禁用时段", "b-ban"];
-    case "blocked":  return ["今日已达上限", "b-ban"];
-    case "resting":  return ["强制休息中"+(s.rest_remaining_sec>0?` · 剩 ${fmtSec(s.rest_remaining_sec)}`:""), "b-rest"];
-    case "watching": return ["观看中", "b-watch"];
-    default:         return ["空闲", "b-off"];
+    case "disabled":  return ["禁用时段", "b-ban"];
+    case "blocked":   return ["今日已达上限", "b-ban"];
+    case "resting":   return ["强制休息中"+(s.rest_remaining_sec>0?` · 剩 ${fmtSec(s.rest_remaining_sec)}`:""), "b-rest"];
+    case "recovering":return ["离线休息中 · 可随时打开", "b-rest"];
+    case "watching":  return ["观看中", "b-watch"];
+    default:          return ["空闲", "b-off"];
   }
 }
 async function poll(){
