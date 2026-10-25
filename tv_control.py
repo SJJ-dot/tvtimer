@@ -32,11 +32,15 @@
 """
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import threading
 import time
 import urllib.request
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -68,6 +72,67 @@ config_lock = threading.Lock()
 
 ALLOWED_KEYS = {"tv_ip", "tv_port", "poll_interval", "max_watch_min", "rest_min",
                 "weekday_total_min", "weekend_total_min", "disabled_windows"}
+# 认证相关键：落盘但不通过 GET /config 返回给前端
+AUTH_KEYS = {"auth_secret", "auth_salt", "auth_password_hash"}
+PBKDF2_ITER = 120_000
+SESSION_DAYS = 30
+LOGIN_LOCK_FAILS = 5          # 连续失败 N 次后锁定该 IP
+LOGIN_LOCK_SEC = 900          # 锁定 15 分钟
+_login_fails = {}             # ip -> [连续失败次数, 锁定截止时间戳]
+
+
+def _hash_password(pw, salt_hex):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                               bytes.fromhex(salt_hex), PBKDF2_ITER).hex()
+
+
+def _verify_password(pw):
+    salt, h = CONFIG.get("auth_salt"), CONFIG.get("auth_password_hash")
+    if not salt or not h:
+        return False
+    return hmac.compare_digest(_hash_password(pw, salt), h)
+
+
+def _set_password(pw):
+    salt = secrets.token_hex(16)
+    with config_lock:
+        CONFIG["auth_salt"] = salt
+        CONFIG["auth_password_hash"] = _hash_password(pw, salt)
+
+
+def _ensure_auth():
+    """启动时初始化认证：无密码则随机生成并在日志打印（仅打印一次）。"""
+    with config_lock:
+        if not CONFIG.get("auth_secret"):
+            CONFIG["auth_secret"] = secrets.token_hex(32)
+    if not CONFIG.get("auth_password_hash"):
+        pw = secrets.token_urlsafe(6)   # 8 位随机密码
+        _set_password(pw)
+        print("\n" + "=" * 56, flush=True)
+        print(f"[认证] 首次启动已生成随机管理密码: {pw}", flush=True)
+        print("[认证] 请立即登录并在「设置-修改密码」中改掉！", flush=True)
+        print("=" * 56 + "\n", flush=True)
+    save_config()
+
+
+def _make_session():
+    exp = int(time.time()) + SESSION_DAYS * 86400
+    msg = str(exp)
+    sig = hmac.new(CONFIG["auth_secret"].encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return f"{msg}.{sig}"
+
+
+def _check_session(token):
+    if not token:
+        return False
+    try:
+        msg, sig = token.split(".", 1)
+        exp = int(msg)
+        good = hmac.compare_digest(
+            sig, hmac.new(CONFIG["auth_secret"].encode(), msg.encode(), hashlib.sha256).hexdigest())
+        return good and exp > time.time()
+    except Exception:
+        return False
 
 
 def load_config():
@@ -76,7 +141,7 @@ def load_config():
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             with config_lock:
-                CONFIG.update({k: v for k, v in data.items() if k in ALLOWED_KEYS})
+                CONFIG.update({k: v for k, v in data.items() if k in ALLOWED_KEYS | AUTH_KEYS})
             print(f"[config] 已从 {CONFIG_PATH} 加载配置")
         except Exception as e:
             print(f"[config] 读取 {CONFIG_PATH} 失败，使用默认: {e}")
@@ -84,7 +149,7 @@ def load_config():
 
 def save_config():
     with config_lock:
-        data = {k: CONFIG[k] for k in ALLOWED_KEYS}
+        data = {k: CONFIG[k] for k in ALLOWED_KEYS | AUTH_KEYS}
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -267,6 +332,7 @@ class TvGuard:
     def __init__(self):
         self.watched_gross_min = 0.0   # 今日累计观看（毛）
         self.rest_credit_min = 0.0     # 今日累计休息抵扣
+        self.carry_min = 0.0           # 结余时长：每日未用完的额度累计到此，不设上限
         self.total_blocked = False     # 今日总时长已用完（重置不解除，次日自动恢复）
         self.last_on_ts = None        # 上一次确认电视在线且可观看的时间戳（累加观看用）
         self.last_view_end_ts = 0.0    # 上一次观看结束（电视离线）时间戳，用于判定是否为新一次
@@ -287,6 +353,7 @@ class TvGuard:
                     "cycle_day_key": self.cycle_day_key,
                     "watched_gross_min": self.watched_gross_min,
                     "rest_credit_min": self.rest_credit_min,
+                    "carry_min": self.carry_min,
                     "total_blocked": self.total_blocked,
                     "rest_until": self.rest_until,
                     "last_view_end_ts": self.last_view_end_ts,
@@ -317,11 +384,12 @@ class TvGuard:
                 self.cycle_day_key = st["cycle_day_key"]
                 self.watched_gross_min = max(0.0, float(st.get("watched_gross_min", 0.0)))
                 self.rest_credit_min = max(0.0, float(st.get("rest_credit_min", 0.0)))
+                self.carry_min = max(0.0, float(st.get("carry_min", 0.0)))
                 self.total_blocked = bool(st.get("total_blocked", False))
                 self.rest_until = float(st.get("rest_until", 0.0))
                 self.last_view_end_ts = float(st.get("last_view_end_ts", 0.0))
             print(f"[state] 已恢复今日观看状态: 毛观看 {self.watched_gross_min:.1f} 分, "
-                  f"抵扣 {self.rest_credit_min:.1f} 分"
+                  f"抵扣 {self.rest_credit_min:.1f} 分, 结余 {self.carry_min:.1f} 分"
                   + (f", 强制休息至 {time.strftime('%H:%M:%S', time.localtime(self.rest_until))}"
                      if self.rest_until > time.time() else ""))
         except Exception as e:
@@ -337,9 +405,11 @@ class TvGuard:
         return max(0.0, min(mx, self.watched_gross_min - self.rest_credit_min))
 
     def _daily_cap(self, now_ts):
-        # 当日可看总时长（毛分钟）：工作日/休息日分别设置（法定节假日/调休感知，见 is_weekday）；0 = 不限
-        cap = CONFIG["weekday_total_min"] if is_weekday(now_ts) else CONFIG["weekend_total_min"]
-        return cap if cap > 0 else 0
+        # 当日可看总时长（毛分钟）= 当日基准额度 + 历史结余；0 = 不限
+        base = CONFIG["weekday_total_min"] if is_weekday(now_ts) else CONFIG["weekend_total_min"]
+        if base <= 0:
+            return 0
+        return base + max(0.0, self.carry_min)
 
     def _try_off(self, reason):
         now = time.time()
@@ -368,9 +438,15 @@ class TvGuard:
         disabled = in_disabled_window(now)
         alive = tv_is_alive()
 
-        # 跨天：重置累计
+        # 跨天：先把昨日未用完的额度结转（不断累计、不设上限），再重置今日累计
         day_key = time.strftime("%Y-%m-%d")
         if day_key != self.cycle_day_key:
+            prev_base = (CONFIG["weekday_total_min"] if is_weekday(now - 86400)
+                         else CONFIG["weekend_total_min"])
+            if prev_base > 0:
+                # 昨日可用 = 昨日基准 + 结余；未用完部分滚入结余
+                self.carry_min = max(0.0, prev_base + self.carry_min - self.watched_gross_min)
+            # 昨日不限额(基准0)时无「未用完」概念，结余保持不变
             self.cycle_day_key = day_key
             self.watched_gross_min = 0.0
             self.rest_credit_min = 0.0
@@ -380,7 +456,7 @@ class TvGuard:
             self.last_off_ts = None
             self.rest_until = 0.0
             self.offline_count = 0
-            print(f"[{logts()}] 跨天，今日观看/总时长已重置")
+            print(f"[{logts()}] 跨天，今日观看已重置；结余时长 {self.carry_min:.1f} 分钟")
 
         with self.lock:
             if disabled:
@@ -511,6 +587,9 @@ class TvGuard:
             "disabled_windows": CONFIG["disabled_windows"],
             "last_action": self.last_action,
             "daily_cap_min": daily_cap,
+            "daily_base_min": (CONFIG["weekday_total_min"] if is_weekday(now)
+                               else CONFIG["weekend_total_min"]),
+            "carry_min": round(max(0.0, self.carry_min), 1),
             "daily_gross_min": round(self.watched_gross_min, 1),
             "daily_remaining_min": (round(max(0.0, daily_cap - self.watched_gross_min), 1)
                                     if daily_cap > 0 else None),
@@ -559,8 +638,10 @@ self.addEventListener("fetch", e => {
   e.respondWith(
     caches.match(e.request).then(r =>
       r || fetch(e.request).then(resp => {
-        const cp = resp.clone();
-        caches.open(CACHE).then(c => c.put(e.request, cp));
+        if (resp && resp.ok) {
+          const cp = resp.clone();
+          caches.open(CACHE).then(c => c.put(e.request, cp));
+        }
         return resp;
       }).catch(() => r)
     )
@@ -583,28 +664,125 @@ ICON_SVG = """\
 
 
 # ============================ HTTP 服务 ============================
+LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>电视管控 · 登录</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    background:#f5f7fa;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+  .box{background:#fff;border:1px solid #e3e8ef;border-radius:14px;padding:28px 24px;width:min(360px,90vw);
+    box-shadow:0 1px 2px rgba(16,24,40,.06)}
+  h1{font-size:18px;margin:0 0 16px;color:#1f2933}
+  input{width:100%;font-size:16px;padding:12px;border:1px solid #e3e8ef;border-radius:10px;box-sizing:border-box}
+  input:focus{outline:none;border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
+  button{width:100%;margin-top:14px;border:none;border-radius:10px;background:#1f6feb;color:#fff;
+    font-size:15px;font-weight:600;padding:12px;cursor:pointer}
+  .err{color:#e5484d;font-size:13px;margin-top:10px;min-height:18px}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>电视管控 · 管理登录</h1>
+  <input type="password" id="pw" placeholder="管理密码" autocomplete="current-password">
+  <button id="go">登 录</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+async function go(){
+  $("go").disabled=true; $("err").textContent="";
+  try{
+    const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({password:$("pw").value})});
+    if(r.ok){location.href="/";return;}
+    const j=await r.json().catch(()=>({}));
+    $("err").textContent=j.error||("登录失败("+r.status+")");
+  }catch(e){$("err").textContent="网络错误";}
+  $("go").disabled=false;
+}
+$("go").addEventListener("click",go);
+$("pw").addEventListener("keydown",e=>{if(e.key==="Enter")go();});
+$("pw").focus();
+</script>
+</body>
+</html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
-    def _send_json(self, obj, code=200):
+    def _send_json(self, obj, code=200, extra_headers=None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        for k, v in (extra_headers or []):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
-    def _send_html(self):
+    def _send_html(self, html=None):
         try:
-            with open(HTML_PATH, "r", encoding="utf-8") as f:
-                html = f.read()
+            if html is None:
+                with open(HTML_PATH, "r", encoding="utf-8") as f:
+                    html = f.read()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
         except Exception:
             self._send_json({"error": "tv_control.html not found"}, 404)
 
+    # ---------- 认证 ----------
+    def _session_token(self):
+        ck = SimpleCookie()
+        try:
+            ck.load(self.headers.get("Cookie", "") or "")
+        except Exception:
+            return None
+        m = ck.get("session")
+        return m.value if m else None
+
+    def _authed(self):
+        return _check_session(self._session_token())
+
+    def _client_ip(self):
+        return self.client_address[0] if self.client_address else "?"
+
+    def _login_locked(self):
+        cnt, lock_until = _login_fails.get(self._client_ip(), (0, 0.0))
+        return max(0.0, lock_until - time.time())
+
+    def _set_session_cookie(self, token, clear=False):
+        proto = (self.headers.get("X-Forwarded-Proto") or "").lower()
+        secure = "; Secure" if proto == "https" else ""
+        if clear:
+            cookie = "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + secure
+        else:
+            cookie = (f"session={token}; Path=/; HttpOnly; SameSite=Strict; "
+                      f"Max-Age={SESSION_DAYS*86400}" + secure)
+        return [("Set-Cookie", cookie)]
+
     def do_GET(self):
         path = urlparse(self.path).path
-        if path in ("/", "/index.html"):
+        if path == "/login":
+            self._send_html(LOGIN_HTML)
+            return
+        if not self._authed():
+            if path in ("/", "/index.html"):
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.end_headers()
+            else:
+                self._send_json({"error": "unauthorized"}, 401)
+            return
+        if path == "/logout":
+            self._send_json({"ok": True}, extra_headers=self._set_session_cookie("", clear=True))
+        elif path in ("/", "/index.html"):
             self._send_html()
         elif path == "/status":
             self._send_json(guard.snapshot())
@@ -633,6 +811,53 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/login":
+            # 登录：每 IP 连续失败 5 次锁定 15 分钟（防暴力破解/PBKDF2 消耗 CPU）
+            locked = self._login_locked()
+            if locked > 0:
+                self._send_json({"ok": False, "error": f"尝试过多，已锁定，请 {int(locked//60)+1} 分钟后再试"}, 429)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            except Exception:
+                data = {}
+            pw = str(data.get("password", ""))
+            if not _verify_password(pw):
+                ip = self._client_ip()
+                cnt, _ = _login_fails.get(ip, (0, 0.0))
+                cnt += 1
+                lock_until = time.time() + LOGIN_LOCK_SEC if cnt >= LOGIN_LOCK_FAILS else 0.0
+                _login_fails[ip] = (cnt, lock_until)
+                time.sleep(min(0.2 * cnt, 1.0))   # 失败轻微延迟，增加爆破成本
+                self._send_json({"ok": False, "error": "密码错误"}, 401)
+                return
+            _login_fails.pop(self._client_ip(), None)
+            self._send_json({"ok": True}, extra_headers=self._set_session_cookie(_make_session()))
+            return
+
+        if path == "/set_password":
+            if not self._authed():
+                self._send_json({"error": "unauthorized"}, 401)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            except Exception:
+                data = {}
+            new_pw = str(data.get("new_password", ""))
+            if len(new_pw) < 6:
+                self._send_json({"ok": False, "error": "密码至少 6 位"}, 400)
+                return
+            _set_password(new_pw)
+            save_config()
+            self._send_json({"ok": True, "message": "密码已更新"})
+            return
+
+        if not self._authed():
+            self._send_json({"error": "unauthorized"}, 401)
+            return
+
         if path == "/config":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -722,6 +947,7 @@ def monitor_loop():
 
 def main():
     load_config()
+    _ensure_auth()
     refresh_urls()
     guard.load_state()   # 恢复今日观看时长（升级/重启不丢）
     ap = argparse.ArgumentParser(description="小米电视管控脚本 + 配置网页")

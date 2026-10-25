@@ -11,9 +11,10 @@ RUN apt-get update \
 
 COPY tv_control.py tv_control.html ./
 
-# 配置落盘目录（容器外挂卷持久化）；默认时区设为中国
+# 配置落盘目录（容器外挂卷持久化）；默认时区设为中国；日志不缓冲（首次启动随机密码立即可见）
 ENV DATA_DIR=/app/data \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    PYTHONUNBUFFERED=1
 
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
