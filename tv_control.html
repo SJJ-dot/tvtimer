@@ -401,10 +401,8 @@ async function poll(){
     $("s-watched").textContent = (s.net_watched_min!=null)? `${s.net_watched_min} 分` : "—";
     $("s-watch").textContent = s.watch_remaining_sec>0? fmtSec(s.watch_remaining_sec) : (s.mode==="watching"?"已满":"—");
     $("s-daily").textContent = (s.daily_cap_min>0)
-      ? `${fmtMin(s.daily_gross_min)} / ${fmtMin(s.daily_cap_min)} 分`
+      ? `${fmtMin(s.daily_gross_min)} / ${fmtMin(s.daily_cap_min)}（${fmtMin(s.daily_base_min)}+${fmtMin(s.carry_min)}）`
       : `${fmtMin(s.daily_gross_min)} 分`;
-    if(s.carry_min>0 && s.daily_cap_min>0)
-      $("s-daily").textContent += ` (含结余 ${fmtMin(s.carry_min)})`;
     // 结余输入框：跟随状态同步，仅在用户未编辑时覆盖
     if(!_carryEdited){
       $("carry_edit").value = s.carry_min;

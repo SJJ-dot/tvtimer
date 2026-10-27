@@ -72,7 +72,7 @@ config_lock = threading.Lock()
 
 # 状态文件里 carry_min 的口径版本：
 #   1（或缺失）= 旧公式 prev_base + carry_old - watched，结余会叠加结余，值可能被放大
-#   2          = 现行口径 prev_base - watched（昨日基准未用完的部分），结余 ≤ 一个基准
+#   2          = 余额滚存模型 prev_base + carry_old - watched（可无限累计，不设上限）
 # 读到版本 < 2 的存量状态时，把脏结余收敛到一个合法上界（见 load_state）。
 CARRY_STATE_VERSION = 2
 
@@ -440,18 +440,20 @@ class TvGuard:
         return max(0.0, min(mx, self.watched_gross_min - self.rest_credit_min))
 
     @staticmethod
-    def _carry_from(prev_base, today_base, watched_prev):
-        """跨天结转：结余 = 昨日基准里没看完的部分（整数分钟）。
+    def _carry_from(prev_base, prev_carry, watched_prev):
+        """跨天结转（余额滚存模型，可无限累计）：
 
-        watched_prev 为昨日毛观看分钟，先四舍五入到整数（关机后统计口径为整数）。
-        昨日基准为 0（不限额）时没有「未用完」的概念，结余归零；
-        封顶到今日基准，保证今日额度 ≤ 2×基准。
+        昨日可用额度 = 昨日基准 + 昨日结余，昨天看不完的部分整体结转为今日结余，
+        不设上限、不把「额度」和「结余」拆开算，故结余可不断累计：
+            第1天 基准60、看30      -> 结余 60-30 = 30
+            第2天 基准60+结余30=90、看30 -> 结余 90-30 = 60
+            第3天 基准60+结余60=120、看30 -> 结余 120-30 = 90
+            ……结余随每天「少看」持续累积。
+        watched_prev 为昨日毛观看分钟，先四舍五入到整数；prev_carry 为昨日带入的结余。
         """
         if prev_base <= 0:
-            return 0.0
-        carry = max(0.0, float(prev_base) - _round_min_int(watched_prev))
-        if today_base > 0:
-            carry = min(carry, float(today_base))
+            return _round_min_int(max(0.0, float(prev_carry) - _round_min_int(watched_prev)))
+        carry = max(0.0, float(prev_base) + float(prev_carry) - _round_min_int(watched_prev))
         return _round_min_int(carry)
 
     def _daily_cap(self, now_ts):
@@ -521,26 +523,12 @@ class TvGuard:
         if day_key != self.cycle_day_key:
             prev_base = (CONFIG["weekday_total_min"] if is_weekday(now - 86400)
                          else CONFIG["weekend_total_min"])
-            today_base = (CONFIG["weekday_total_min"] if is_weekday(now)
-                          else CONFIG["weekend_total_min"])
-            # 【BUG 修复：结余被重复计入】
-            #
-            # 旧公式 carry = prev_base + carry_old - watched 是「结余余额滚存」模型：
-            # carry_old 已经被加进昨天的可用额度里（昨日可用 = prev_base + carry_old），
-            # 昨天剩下的 (prev_base + carry_old - watched) 又整体变成今天的结余，
-            # 于是同一笔未用时长每天都在「额度」和「结余」里各算一次，越滚越大：
-            #   周日(120) 剩 60  -> 周一额度 120（用户以为还是 60）
-            #   周一看了 30      -> 结余 = 60 + 60 - 30 = 90   <-- 本该是 60-30=30
-            #   周二额度 = 60 + 90 = 150                       <-- 工作日设的 60
-            # 用户一天最多也就看了 30 分钟，额度却从 60 涨到 150，这就是「凭空多出 90」。
-            #
-            # 正确口径：结余 = 昨日基准里没看完的部分，不再叠加前一天的结余。
-            #   周一(60) 看 30 -> 结余 30 -> 周二额度 = 60 + 30 = 90。
-            # 昨日不限额(基准0)或昨天没开机时，没有「未用完」可言，结余归零，
-            # 避免「因为没记录所以当成整份没看」又造出一笔假结余。
-            self.carry_min = self._carry_from(prev_base, today_base, self.watched_gross_min)
+            # 余额滚存：今日结余 = 昨日(基准+结余) - 昨日已看，可无限累计。
+            # self.carry_min 此刻仍是昨日带入的结余，作为 prev_carry 参与结转。
+            self.carry_min = self._carry_from(prev_base, self.carry_min, self.watched_gross_min)
             if prev_base > 0:
-                print(f"[{logts()}] 跨天结转: 昨日基准 {prev_base} 分 - 已看 "
+                print(f"[{logts()}] 跨天结转: 昨日(基准 {prev_base} + 结余 "
+                      f"{_round_min_int(self.carry_min):.0f}) - 已看 "
                       f"{_round_min_int(self.watched_gross_min):.0f} 分 "
                       f"= 结余 {self.carry_min:.0f} 分")
             self.cycle_day_key = day_key
