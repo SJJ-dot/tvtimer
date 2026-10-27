@@ -11,7 +11,7 @@
      跨「关一下再开」不会清零，因此「看20→关1→又看」无法凭空多放时间（防卡 BUG）。
   3) 强制休息时长：强制关机后须休息指定时长（如 40 分钟）才能再开机，
      休息期间被发现开机同样自动关机。可手动「重置休息」立即清零抵扣、立即可看。
-  4) 每日总时长：工作日/休息日分别设「每天可看总时长（分钟）」，只按实际观看时间计
+  4) 每日总时长：工作日/非工作日分别设「每天可看总时长（分钟）」，只按实际观看时间计
      （与开关机次数无关），达额度当天封禁，次日自动恢复；0 = 不限制。
      工作日/休息日按法定节假日判定（holiday-cn 数据，每月自动更新，离线回退星期几）。
 
@@ -51,8 +51,8 @@ CONFIG = {
     "poll_interval": 5,
     "max_watch_min": 30,
     "rest_min": 40,
-    "weekday_total_min": 60,   # 工作日（周一~五）每天可看总时长（毛分钟）；0 = 不限制
-    "weekend_total_min": 120,  # 周末（六、日）每天可看总时长（毛分钟）；0 = 不限制
+    "weekday_total_min": 60,   # 工作日每天可看总时长（毛分钟）；0 = 不限制
+    "weekend_total_min": 120,  # 非工作日每天可看总时长（毛分钟）；0 = 不限制
     "off_cooldown_sec": 10,
     "disabled_windows": [
         ["23:00", "07:00"],
@@ -69,6 +69,12 @@ CONFIG_PATH = os.path.join(DATA_DIR, "tv_control_config.json")
 STATE_PATH = os.path.join(DATA_DIR, "guard_state.json")
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tv_control.html")
 config_lock = threading.Lock()
+
+# 状态文件里 carry_min 的口径版本：
+#   1（或缺失）= 旧公式 prev_base + carry_old - watched，结余会叠加结余，值可能被放大
+#   2          = 现行口径 prev_base - watched（昨日基准未用完的部分），结余 ≤ 一个基准
+# 读到版本 < 2 的存量状态时，把脏结余收敛到一个合法上界（见 load_state）。
+CARRY_STATE_VERSION = 2
 
 ALLOWED_KEYS = {"tv_ip", "tv_port", "poll_interval", "max_watch_min", "rest_min",
                 "weekday_total_min", "weekend_total_min", "disabled_windows"}
@@ -194,6 +200,12 @@ def power_off():
         _http_get(POWER_URL)
         return True
     return False
+
+
+def _round_min_int(minutes):
+    """四舍五入到整数分钟（非负数，四舍五入而非银行家舍入）。"""
+    x = max(0.0, float(minutes))
+    return float(int(x + 0.5))
 
 
 def _round_sec(minutes):
@@ -324,7 +336,7 @@ class TvGuard:
       - 净已看 net = clamp(watched_gross_min - rest_credit_min, 0, max_watch_min)
       - 电视开机时，已看就按 net 计；net 达到上限即强制关机并进入休息。
       - 防卡 BUG：看 20 分钟、关 1 分钟、又看，关的 1 分钟只抵扣 0.75 分钟，无法凭空多放时间。
-      - 每日总时长：工作日 weekday_total_min / 休息日 weekend_total_min（毛分钟，0=不限）。
+      - 每日总时长：工作日 weekday_total_min / 非工作日 weekend_total_min（毛分钟，0=不限）。
         只按实际观看时间计，与开关机次数无关（网络抖动/探测误判不会误扣额度）。
         达额度当天封禁（total_blocked），次日重置。
       - 禁用时段内强制关机，且禁用时段不计休息抵扣（属惩罚，不算恢复）。
@@ -343,7 +355,7 @@ class TvGuard:
     def __init__(self):
         self.watched_gross_min = 0.0   # 今日累计观看（毛）
         self.rest_credit_min = 0.0     # 今日累计休息抵扣
-        self.carry_min = 0.0           # 结余时长：每日未用完的额度累计到此，不设上限
+        self.carry_min = 0.0           # 结余时长：昨日基准未用完的部分（可手动增减）
         self.total_blocked = False     # 今日总时长已用完（重置不解除，次日自动恢复）
         self.last_on_ts = None        # 上一次确认电视在线且可观看的时间戳（累加观看用）
         self.last_view_end_ts = 0.0    # 上一次观看结束（电视离线）时间戳，用于判定是否为新一次
@@ -365,6 +377,7 @@ class TvGuard:
                     "watched_gross_min": self.watched_gross_min,
                     "rest_credit_min": self.rest_credit_min,
                     "carry_min": self.carry_min,
+                    "carry_v": CARRY_STATE_VERSION,
                     "total_blocked": self.total_blocked,
                     "rest_until": self.rest_until,
                     "last_view_end_ts": self.last_view_end_ts,
@@ -395,12 +408,23 @@ class TvGuard:
                 self.cycle_day_key = st["cycle_day_key"]
                 self.watched_gross_min = max(0.0, float(st.get("watched_gross_min", 0.0)))
                 self.rest_credit_min = max(0.0, float(st.get("rest_credit_min", 0.0)))
-                self.carry_min = _round_sec(max(0.0, float(st.get("carry_min", 0.0))))
+                self.carry_min = _round_min_int(max(0.0, float(st.get("carry_min", 0.0))))
+                carry_ver = int(st.get("carry_v", 1))
                 self.total_blocked = bool(st.get("total_blocked", False))
                 self.rest_until = float(st.get("rest_until", 0.0))
                 self.last_view_end_ts = float(st.get("last_view_end_ts", 0.0))
+            # 存量脏结余清理：carry_v < 2 的状态文件由旧公式写入，
+            # 结余里叠了上一轮的结余（如工作日 60、昨天只看了 30，却存成 90）。
+            # 旧口径下结余最多也只能是「昨日基准未用完」的量，故收敛到昨日基准；
+            # 想要精确值可在网页里手动调整结余（只影响今天）。
+            if carry_ver < CARRY_STATE_VERSION:
+                before = self.carry_min
+                clamped = self._clamp_carry(time.time() - 86400)
+                if clamped != before:
+                    print(f"[state] 旧版结余已收敛: {before:.0f} -> {clamped:.0f} 分"
+                          f"（可在网页手动调整结余）")
             print(f"[state] 已恢复今日观看状态: 毛观看 {self.watched_gross_min:.1f} 分, "
-                  f"抵扣 {self.rest_credit_min:.1f} 分, 结余 {self.carry_min:.1f} 分"
+                  f"抵扣 {self.rest_credit_min:.1f} 分, 结余 {self.carry_min:.0f} 分"
                   + (f", 强制休息至 {time.strftime('%H:%M:%S', time.localtime(self.rest_until))}"
                      if self.rest_until > time.time() else ""))
         except Exception as e:
@@ -415,12 +439,55 @@ class TvGuard:
         mx = CONFIG["max_watch_min"]
         return max(0.0, min(mx, self.watched_gross_min - self.rest_credit_min))
 
+    @staticmethod
+    def _carry_from(prev_base, today_base, watched_prev):
+        """跨天结转：结余 = 昨日基准里没看完的部分（整数分钟）。
+
+        watched_prev 为昨日毛观看分钟，先四舍五入到整数（关机后统计口径为整数）。
+        昨日基准为 0（不限额）时没有「未用完」的概念，结余归零；
+        封顶到今日基准，保证今日额度 ≤ 2×基准。
+        """
+        if prev_base <= 0:
+            return 0.0
+        carry = max(0.0, float(prev_base) - _round_min_int(watched_prev))
+        if today_base > 0:
+            carry = min(carry, float(today_base))
+        return _round_min_int(carry)
+
     def _daily_cap(self, now_ts):
-        # 当日可看总时长（毛分钟）= 当日基准额度 + 历史结余；0 = 不限
+        # 当日可看总时长（毛分钟）= 当日基准额度 + 结余。
+        # 基准为 0 表示不限额；结余 ≤ 一个基准量，故额度上限 = 2×基准。
+        # 注意：snapshot() 已持有 self.lock（非重入锁），这里不能再取锁。
         base = CONFIG["weekday_total_min"] if is_weekday(now_ts) else CONFIG["weekend_total_min"]
         if base <= 0:
             return 0
         return base + max(0.0, self.carry_min)
+
+    def _clamp_carry(self, day_ts):
+        """把结余收敛到不超过指定日期的基准量（用于清理旧版脏结余）。"""
+        base = (CONFIG["weekday_total_min"] if is_weekday(day_ts)
+                else CONFIG["weekend_total_min"])
+        if base > 0 and self.carry_min > base:
+            self.carry_min = float(base)
+        return self.carry_min
+
+    def set_carry(self, val):
+        """手动设定结余时长（分钟，非负整数）；返回实际生效值。"""
+        v = _round_min_int(max(0.0, float(val)))
+        with self.lock:
+            self.carry_min = v
+        self.save_state()
+        print(f"[{logts()}] 手动设定结余时长 = {v:.0f} 分钟")
+        return v
+
+    def adjust_carry(self, delta):
+        """在当前结余上增加/减少若干分钟（负数即缩短）。"""
+        with self.lock:
+            cur = self.carry_min
+        return self.set_carry(cur + float(delta))
+
+    def daily_cap_now(self):
+        return self._daily_cap(time.time())
 
     def _try_off(self, reason):
         now = time.time()
@@ -454,14 +521,28 @@ class TvGuard:
         if day_key != self.cycle_day_key:
             prev_base = (CONFIG["weekday_total_min"] if is_weekday(now - 86400)
                          else CONFIG["weekend_total_min"])
+            today_base = (CONFIG["weekday_total_min"] if is_weekday(now)
+                          else CONFIG["weekend_total_min"])
+            # 【BUG 修复：结余被重复计入】
+            #
+            # 旧公式 carry = prev_base + carry_old - watched 是「结余余额滚存」模型：
+            # carry_old 已经被加进昨天的可用额度里（昨日可用 = prev_base + carry_old），
+            # 昨天剩下的 (prev_base + carry_old - watched) 又整体变成今天的结余，
+            # 于是同一笔未用时长每天都在「额度」和「结余」里各算一次，越滚越大：
+            #   周日(120) 剩 60  -> 周一额度 120（用户以为还是 60）
+            #   周一看了 30      -> 结余 = 60 + 60 - 30 = 90   <-- 本该是 60-30=30
+            #   周二额度 = 60 + 90 = 150                       <-- 工作日设的 60
+            # 用户一天最多也就看了 30 分钟，额度却从 60 涨到 150，这就是「凭空多出 90」。
+            #
+            # 正确口径：结余 = 昨日基准里没看完的部分，不再叠加前一天的结余。
+            #   周一(60) 看 30 -> 结余 30 -> 周二额度 = 60 + 30 = 90。
+            # 昨日不限额(基准0)或昨天没开机时，没有「未用完」可言，结余归零，
+            # 避免「因为没记录所以当成整份没看」又造出一笔假结余。
+            self.carry_min = self._carry_from(prev_base, today_base, self.watched_gross_min)
             if prev_base > 0:
-                # 昨日可用 = 昨日基准 + 结余；未用完部分滚入结余
-                # 取整到「秒」再折算分钟：watched_gross_min 由逐次 delta 累加而来，
-                # 带 IEEE754 浮点误差；若不归整，脏值会被结余继承并逐日沉淀放大，
-                # 最终出现 149.9190133213997 分这类脏数字。
-                carry = max(0.0, prev_base + self.carry_min - self.watched_gross_min)
-                self.carry_min = _round_sec(carry)
-            # 昨日不限额(基准0)时无「未用完」概念，结余保持不变
+                print(f"[{logts()}] 跨天结转: 昨日基准 {prev_base} 分 - 已看 "
+                      f"{_round_min_int(self.watched_gross_min):.0f} 分 "
+                      f"= 结余 {self.carry_min:.0f} 分")
             self.cycle_day_key = day_key
             self.watched_gross_min = 0.0
             self.rest_credit_min = 0.0
@@ -471,7 +552,7 @@ class TvGuard:
             self.last_off_ts = None
             self.rest_until = 0.0
             self.offline_count = 0
-            print(f"[{logts()}] 跨天，今日观看已重置；结余时长 {self.carry_min:.1f} 分钟")
+            print(f"[{logts()}] 跨天，今日观看已重置；结余时长 {self.carry_min:.0f} 分钟")
 
         with self.lock:
             if disabled:
@@ -584,15 +665,18 @@ class TvGuard:
             else:
                 mode = "idle"
             daily_cap = self._daily_cap(now)
+            base_auto = (CONFIG["weekday_total_min"] if is_weekday(now)
+                         else CONFIG["weekend_total_min"])
             remaining_cycle = max(0.0, mx - net)
         return {
             "tv_ip": CONFIG["tv_ip"],
             "disabled_now": disabled,
             "workday_today": is_weekday(now),
             "mode": mode,
-            "net_watched_min": round(net, 1),
-            "watched_gross_min": round(self.watched_gross_min, 1),
-            "rest_credit_min": round(self.rest_credit_min, 1),
+            # 统计口径：关机后四舍五入为整数分钟，前端不再出现 29.999999999999844
+            "net_watched_min": _round_min_int(net),
+            "watched_gross_min": _round_min_int(self.watched_gross_min),
+            "rest_credit_min": _round_min_int(self.rest_credit_min),
             "ratio": round(ratio, 3),
             "cycle_remaining_min": round(remaining_cycle, 1),
             "watch_remaining_sec": int(remaining_cycle * 60),
@@ -601,13 +685,14 @@ class TvGuard:
             "rest_min": CONFIG["rest_min"],
             "disabled_windows": CONFIG["disabled_windows"],
             "last_action": self.last_action,
-            # daily_cap_min 也要归整：它是 base + carry 直接相加，
-            # 未取整时前端会显示 149.9190133213997 分这类浮点尾数
             "daily_cap_min": _round_sec(daily_cap) if daily_cap > 0 else daily_cap,
+            "daily_cap_auto": (round(base_auto + max(0.0, self.carry_min), 1)
+                               if base_auto > 0 else 0),
             "daily_base_min": (CONFIG["weekday_total_min"] if is_weekday(now)
                                else CONFIG["weekend_total_min"]),
-            "carry_min": round(max(0.0, self.carry_min), 1),
-            "daily_gross_min": round(self.watched_gross_min, 1),
+            # 结余按整数分钟展示/编辑，避免 89.9190133213997 这类浮点尾数
+            "carry_min": _round_min_int(self.carry_min),
+            "daily_gross_min": _round_min_int(self.watched_gross_min),
             "daily_remaining_min": (round(max(0.0, daily_cap - self.watched_gross_min), 1)
                                     if daily_cap > 0 else None),
             "daily_blocked": self.total_blocked,
@@ -1007,6 +1092,30 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "message": "电视当前不在线或未响应"}, 400)
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, 500)
+        elif path == "/carry":
+            # 手动调整「结余时长」（昨日基准没看完的部分）：
+            #   {"set_min": 30}   直接设定为 30 分钟
+            #   {"delta_min": -10} 在当前值上增加/减少（负数=缩短）
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            except Exception:
+                body = {}
+            if not isinstance(body, dict) or ("set_min" not in body and "delta_min" not in body):
+                self._send_json({"ok": False, "error": "缺少 set_min 或 delta_min"}, 400)
+                return
+            try:
+                if body.get("set_min") is not None:
+                    val = guard.set_carry(body["set_min"])
+                else:
+                    val = guard.adjust_carry(body.get("delta_min", 0))
+            except (TypeError, ValueError):
+                self._send_json({"ok": False, "error": "数值无效"}, 400)
+                return
+            self._send_json({"ok": True, "message": f"结余已设为 {val:.0f} 分钟",
+                             "carry_min": val,
+                             "daily_cap_min": guard.daily_cap_now()})
+            return
         elif path == "/reset_rest":
             # 手动重置休息：净已看归零、清强制休息闸门，立即可看；不解除当日总时长封禁
             guard.reset_rest()
@@ -1021,7 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
 def monitor_loop():
     print(f"[{logts()}] 监控启动: TV={CONFIG['tv_ip']}:{CONFIG['tv_port']} "
           f"最长观看={CONFIG['max_watch_min']}min 休息={CONFIG['rest_min']}min "
-          f"每日总时长(工作日/休息日)={CONFIG['weekday_total_min']}/{CONFIG['weekend_total_min']}min "
+          f"每日总时长(工作日/非工作日)={CONFIG['weekday_total_min']}/{CONFIG['weekend_total_min']}min "
           f"禁用时段={CONFIG['disabled_windows']} 轮询={CONFIG['poll_interval']}s")
     while True:
         try:

@@ -126,15 +126,30 @@
     <h2>每日可看总时长（分钟）</h2>
     <div class="row2">
       <div>
-        <label>工作日（周一~五）</label>
+        <label>工作日</label>
         <input type="number" id="weekday_total_min" min="0" inputmode="numeric">
       </div>
       <div>
-        <label>休息日（六、日）</label>
+        <label>非工作日</label>
         <input type="number" id="weekend_total_min" min="0" inputmode="numeric">
       </div>
     </div>
-    <div class="hint">每天可看的基准总时长，只按实际观看时间计，与开关机次数无关。达上限当天不可再看，次日恢复。0=不限制。当天没用完的时长会自动结余到以后，不断累计不设上限。</div>
+    <div class="hint">每天可看的基准总时长，只按实际观看时间计，与开关机次数无关。达上限当天不可再看，次日恢复。0=不限制。当天没用完的时长会结余到次日，结余不叠加前一天的结余，最多保留一个基准量。</div>
+    <div class="row2" style="margin-top:12px">
+      <div>
+        <label>结余时长（分钟，可手动增减）</label>
+        <input type="number" id="carry_edit" min="0" step="1" inputmode="numeric" placeholder="0">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost2" id="carryMinus">−10</button>
+          <button class="btn btn-ghost2" id="carryApply">应用</button>
+          <button class="btn btn-ghost2" id="carryPlus">+10</button>
+        </div>
+      </div>
+    </div>
+    <div class="hint" id="carryHint">结余 = 昨天基准里没看完的部分（不再叠加前一天的结余）。今日额度 = 基准 + 结余。</div>
   </div>
 
   <div class="card">
@@ -174,6 +189,11 @@ function fmtSec(s){
   if(s<=0) return "0";
   const m=Math.floor(s/60), ss=s%60;
   return m>0 ? `${m}分${ss.toString().padStart(2,'0')}秒` : `${ss}秒`;
+}
+function fmtMin(v){
+  if(v==null) return "—";
+  const r=Math.round(v*10)/10;
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
 }
 function toast(msg, type){
   const t=$("toast"); t.textContent=msg; t.className="toast show "+(type||"");
@@ -339,6 +359,27 @@ $("powerOff").addEventListener("click", async ()=>{
   finally{ setTimeout(()=>btn.disabled=false, 3000); }
 });
 
+/* ---------- 手动调整结余时长（增加 / 缩短） ---------- */
+let _carryEdited=false;
+$("carry_edit").addEventListener("input", ()=>{ _carryEdited=true; });
+async function postCarry(payload, btn){
+  btn.disabled=true;
+  try{
+    const r=await fetch("/carry",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)});
+    const j=await r.json();
+    if(j.ok){ toast(j.message||"已更新","ok"); _carryEdited=false; await poll(); }
+    else{ toast(j.error||"更新失败","err"); }
+  }catch(e){ toast("请求失败","err"); }
+  finally{ btn.disabled=false; }
+}
+$("carryApply").addEventListener("click", ()=>{
+  const raw=$("carry_edit").value.trim();
+  postCarry({set_min: raw===""?0:(parseFloat(raw)||0)}, $("carryApply"));
+});
+$("carryPlus").addEventListener("click", ()=> postCarry({delta_min:10}, $("carryPlus")));
+$("carryMinus").addEventListener("click", ()=> postCarry({delta_min:-10}, $("carryMinus")));
+
 /* ---------- 状态轮询 ---------- */
 function modeBadge(s){
   switch(s.mode){
@@ -360,12 +401,20 @@ async function poll(){
     $("s-watched").textContent = (s.net_watched_min!=null)? `${s.net_watched_min} 分` : "—";
     $("s-watch").textContent = s.watch_remaining_sec>0? fmtSec(s.watch_remaining_sec) : (s.mode==="watching"?"已满":"—");
     $("s-daily").textContent = (s.daily_cap_min>0)
-      ? `${s.daily_gross_min} / ${s.daily_cap_min} 分`
-      : `${s.daily_gross_min} 分`;
-    if(s.carry_min>0 && s.daily_cap_min>0) $("s-daily").textContent += ` (含结余 ${s.carry_min})`;
+      ? `${fmtMin(s.daily_gross_min)} / ${fmtMin(s.daily_cap_min)} 分`
+      : `${fmtMin(s.daily_gross_min)} 分`;
+    if(s.carry_min>0 && s.daily_cap_min>0)
+      $("s-daily").textContent += ` (含结余 ${fmtMin(s.carry_min)})`;
+    // 结余输入框：跟随状态同步，仅在用户未编辑时覆盖
+    if(!_carryEdited){
+      $("carry_edit").value = s.carry_min;
+      $("carryHint").textContent = (s.daily_cap_min>0)
+        ? `当前结余 ${fmtMin(s.carry_min)} 分 → 今日额度 = 基准 ${fmtMin(s.daily_base_min)} + 结余 ${fmtMin(s.carry_min)} = ${fmtMin(s.daily_cap_min)} 分。手动修改只影响今天，明天按实际观看重新计算。`
+        : `今日不限额（基准为 0），结余不参与计算。`;
+    }
     $("s-ip").textContent="电视 "+(s.tv_ip||"")
       +(s.disabled_now?" · 禁用时段":"")
-      +(s.workday_today!=null?` · 今日按${s.workday_today?"工作日":"休息日"}额度`:"");
+      +(s.workday_today!=null?` · 今日按${s.workday_today?"工作日":"非工作日"}额度`:"");
   }catch(e){}
 }
 load();

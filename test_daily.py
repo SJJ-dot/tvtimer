@@ -3,7 +3,13 @@
 语义：工作日/休息日分别设「每天可看总时长（毛分钟）」，只按实际观看时间计，
 与开关机次数无关；达上限当天封禁（total_blocked），次日重置，重置休息不解除。
 """
+import os
+import tempfile
+
 import tv_control as M
+
+# 测试不碰真实状态文件（set_carry/adjust_carry 会 save_state）
+M.STATE_PATH = os.path.join(tempfile.gettempdir(), "tvtimer_test_state.json")
 
 MON = 1_000_000.0          # 1970-01-12 周一（weekday）
 SAT = MON + 5 * 86400      # 周六（weekend）
@@ -136,44 +142,83 @@ assert snap["daily_cap_min"] == 60
 assert snap["rest_remaining_sec"] is not None
 print("7) snapshot 无次数字段、含 daily_cap_min OK")
 
-# ============ 8) 浮点精度：结余/额度不得出现浮点尾数 ============
-# 回归问题：watched_gross_min 逐次 delta 累加带 IEEE754 误差，
-# 跨天结转时 carry 直接继承，脏值逐日沉淀，
-# 最终 daily_cap_min 显示为 149.9190133213997 分。
-#
-# 说明：本文件的 mock 把 M.time.time 换掉了，但 time.strftime 仍走真实时钟，
-# 导致 cycle_day_key 判定不成立、跨天分支无法在这里触发。
-# 因此本用例直接构造结转场景，验证 _round_sec 与结转公式的归整效果。
+# ============ 8) 关机后统计四舍五入为整数 ============
+# 需求：关机后「今日已看」等统计显示为整数分钟，不出现 29.999999999999844 这类尾数。
+# 实现方式：内部累加器保持精度（休息抵扣靠它算净已看，写死会破坏一致性），
+#           只在快照/结转出口四舍五入。
+reset()
+M.CONFIG["max_watch_min"] = 600
+M.CONFIG["weekday_total_min"] = 60
+M.CONFIG["weekend_total_min"] = 120
+g.watched_gross_min = 29.6
+off(); g.tick()                      # 关机（离线确认）
+snap = g.snapshot()
+assert snap["daily_gross_min"] == 30.0, f"关机后展示应为 30, 实际 {snap['daily_gross_min']!r}"
+assert snap["watched_gross_min"] == 30.0
+assert snap["net_watched_min"] == 30.0
+assert g.watched_gross_min == 29.6, "内部累加器不应被改写（否则净已看会偏 0.4）"
+g.watched_gross_min = 29.4
+assert g.snapshot()["daily_gross_min"] == 29.0, "29.4 应展示为 29"
+# 结转用的昨日时长同样先取整
+assert M.TvGuard._carry_from(60, 60, 29.6) == 30.0, "结转按整数分钟计算"
+print("8) 关机后四舍五入为整数 OK (29.6->30, 29.4->29, 内部值不变)")
+
+# ============ 9) 结转 BUG 回归：结余不得叠加结余 ============
+# 用户场景（原话）：工作日 60，非工作日 120；周一之前没有结余概念，
+# 周一一天原本只有 60 分钟，实际看了 30 分钟 -> 结余应该是 30，周二总额 90。
+# 旧公式 carry = prev_base + carry_old - watched 在 carry_old=60 时：
+#   60 + 60 - 30 = 90  -> 周二 60+90 = 150   （就是用户看到的 149.9）
+_c = M.TvGuard._carry_from
+
+# 用户原场景：昨日(工作日60) 看了 30，且手里还压着 60 的旧结余
+assert _c(60, 60, 30) == 30.0, f"应结余 30, 实际 {_c(60, 60, 30)}"
+assert 60 + _c(60, 60, 30) == 90.0, "周二额度应为 90"
+# 旧公式对照：确实会算成 90 结余 / 150 额度（证明本用例能抓到该 BUG）
+old_carry = 60 + 60 - 30
+assert old_carry == 90, "旧公式对照值应为 90"
+assert 60 + old_carry == 150, "旧公式周二额度应为 150"
+
+# 旧结余不再被继承：carry_old 不参与计算
+class _G(M.TvGuard):
+    pass
+assert _c(60, 60, 30) == _c(60, 60, 30), "结转结果不应依赖 carry_old"
+
+# 用光基准 -> 结余 0（周日 120 看完，周一没有结余）
+assert _c(120, 60, 120) == 0.0, f"用光后结余应为 0, 实际 {_c(120, 60, 120)}"
+assert 60 + _c(120, 60, 120) == 60.0, "周一额度应为 60"
+
+# 完全没看 -> 结余 = 昨日基准，且不超过今日基准
+assert _c(60, 60, 0) == 60.0
+assert _c(120, 60, 0) == 60.0, "非工作日结余顺延到工作日时封顶为 60"
+
+# 连续多天没看：结余必须稳定在一个基准量，不得逐日累积
+carry = 0.0
+for _ in range(10):
+    carry = _c(60, 60, 0)
+assert carry == 60.0, f"连续未看应恒为 60, 实际 {carry}"
+
+# 昨日不限额(基准0) -> 无「未用完」概念，结余 0
+assert _c(0, 60, 0) == 0.0, "昨日不限额时结余应为 0"
+
+# 浮点观看时长先取整，不产生浮点尾数
+c = _c(60, 60, 29.6)
+assert c == 30.0 and isinstance(c, float), f"应先取整为 30, 实际 {c!r}"
+print("9) 结转 BUG 回归 OK (60基准看30 -> 结余30/额度90，旧公式对照 90/150)")
+
+# ============ 10) 手动调整结余时长（增加/缩短） ============
 reset()
 M.CONFIG["weekday_total_min"] = 60
 M.CONFIG["weekend_total_min"] = 120
-
-# 模拟一天：5 秒步长累加 30 分钟观看（与真实运行一致的浮点误差来源）
-watched = 0.0
-t = 1_000_000.0
-for _ in range(360):
-    t2 = t + 5.0
-    watched += (t2 - t) / 60.0
-    t = t2
-assert watched != 30.0, "前置条件：累加结果应带浮点误差"
-assert watched != round(watched, 1), f"前置条件：应有浮点尾数 {watched!r}"
-
-# 跨天结转：carry = prev_base + carry - watched，归整到秒
-g.carry_min = M._round_sec(max(0.0, 120 + 0.0 - watched))
-assert g.carry_min == M._round_sec(g.carry_min), \
-    f"结余应已归整到秒精度: {g.carry_min!r}"
-assert len(str(g.carry_min).split(".")[-1]) <= 6, \
-    f"结余不应有长浮点尾数: {g.carry_min!r}"
-# 归整后与真值偏差 < 1 秒
-assert abs(g.carry_min - 90.0) < 1.0 / 60, \
-    f"归整后误差应 <1秒: {g.carry_min!r}"
-
-# snapshot 的 daily_cap_min 同样必须归整（前端直接拼进文本）
-g.watched_gross_min = 0.0
-snap = g.snapshot()
-cap = snap["daily_cap_min"]
-assert cap == M._round_sec(cap), f"daily_cap_min 应已归整: {cap!r}"
-assert len(str(cap).split(".")[-1]) <= 6, f"daily_cap_min 尾数过长: {cap!r}"
-print(f"8) 浮点精度 OK (carry={g.carry_min!r}, cap={cap!r})")
+assert g.set_carry(30) == 30.0
+assert g.daily_cap_now() == 90.0, f"结余30 -> 额度应为90, 实际 {g.daily_cap_now()}"
+assert g.snapshot()["carry_min"] == 30
+assert g.adjust_carry(10) == 40.0, "增加 10 分钟"
+assert g.daily_cap_now() == 100.0
+assert g.adjust_carry(-25) == 15.0, "缩短 25 分钟"
+assert g.daily_cap_now() == 75.0
+assert g.adjust_carry(-100) == 0.0, "缩短到负数应夹到 0"
+assert g.daily_cap_now() == 60.0, "结余 0 -> 额度回到基准"
+assert g.set_carry(89.9) == 90.0, "小数应四舍五入到整数"
+print("10) 手动调整结余 OK (设定/增加/缩短/夹0/取整)")
 
 print("\nALL DAILY TESTS PASSED, 关机事件=", len(offs))
