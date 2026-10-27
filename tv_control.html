@@ -207,8 +207,33 @@ function renderWindows(list){
 }
 let cur=[];
 
-/* ---------- 401 统一跳登录 ---------- */
-function checkAuth(r){ if(r.status===401){ location.href="/login"; throw new Error("unauthorized"); } return r; }
+/* ---------- 本机免验证：cookie 失效时用 localStorage token 静默续期 ---------- */
+let _autoLoginTried=false;
+async function tryAutoLogin(){
+  let tok=null;
+  try{ tok=localStorage.getItem("tvtimer_token"); }catch(e){}
+  if(!tok) return false;
+  try{
+    const r=await fetch("/auto_login",{method:"POST",headers:{"Authorization":"Bearer "+tok}});
+    if(r.ok){ return true; }
+    if(r.status===401){ try{ localStorage.removeItem("tvtimer_token"); }catch(e){} }
+  }catch(e){}
+  return false;
+}
+/* ---------- 401 统一跳登录（先尝试本机免验证续期） ---------- */
+async function checkAuth(r){
+  if(r.status===401){
+    if(!_autoLoginTried){
+      _autoLoginTried=true;
+      if(await tryAutoLogin()){
+        location.reload();
+        await new Promise(()=>{});   // 挂起，等待 reload 生效，避免用旧响应继续渲染
+      }
+    }
+    location.href="/login"; throw new Error("unauthorized");
+  }
+  return r;
+}
 
 /* ---------- 修改密码 / 退出登录 ---------- */
 $("changePw").addEventListener("click", async ()=>{
@@ -225,13 +250,14 @@ $("changePw").addEventListener("click", async ()=>{
 });
 $("logout").addEventListener("click", async ()=>{
   try{ await fetch("/logout"); }catch(e){}
+  try{ localStorage.removeItem("tvtimer_token"); }catch(e){}
   location.href="/login";
 });
 
 /* ---------- 加载配置 ---------- */
 async function load(){
   try{
-    const r=await fetch("/config"); checkAuth(r); const c=await r.json();
+    const r=await fetch("/config"); await checkAuth(r); const c=await r.json();
     $("tv_ip").value=c.tv_ip||"";
     $("max_watch_min").value=c.max_watch_min??30;
     $("rest_min").value=c.rest_min??40;
@@ -326,7 +352,7 @@ function modeBadge(s){
 }
 async function poll(){
   try{
-    const r=await fetch("/status"); checkAuth(r); const s=await r.json();
+    const r=await fetch("/status"); await checkAuth(r); const s=await r.json();
     const [mt,mc]=modeBadge(s);
     const online = (s.mode==="watching");
     $("s-tv").innerHTML = `<span class="badge ${online?'b-watch':'b-off'}">${online?'在线':'离线'}</span>`;

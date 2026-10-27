@@ -62,7 +62,10 @@ try:
     code, hdrs, body = req("/login", json.dumps({"password": pw}).encode())
     assert code == 200, (code, body)
     setc = hdrs.get("Set-Cookie", "")
-    assert "HttpOnly" in setc and "SameSite=Strict" in setc
+    # SameSite 必须是 Lax：Strict 下 PWA（安装到桌面）跨站启动不携带 cookie，
+    # 手机端每次启动都会弹密码框
+    assert "HttpOnly" in setc and "SameSite=Lax" in setc
+    assert "SameSite=Strict" not in setc
     token = setc.split(";")[0].split("=", 1)[1]
     # 4) 登录后访问
     code, _, body = req("/status", cookie="session=" + token)

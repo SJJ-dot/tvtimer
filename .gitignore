@@ -4,3 +4,4 @@ __pycache__/
 data/
 holiday_cn_*.json
 guard_state.json
+.workbuddy/

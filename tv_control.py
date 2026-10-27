@@ -75,7 +75,8 @@ ALLOWED_KEYS = {"tv_ip", "tv_port", "poll_interval", "max_watch_min", "rest_min"
 # 认证相关键：落盘但不通过 GET /config 返回给前端
 AUTH_KEYS = {"auth_secret", "auth_salt", "auth_password_hash"}
 PBKDF2_ITER = 120_000
-SESSION_DAYS = 30
+SESSION_DAYS = 30            # 普通会话有效期（天）
+REMEMBER_DAYS = 365         # 勾选「记住本机」后的免验证有效期（天）
 LOGIN_LOCK_FAILS = 5          # 连续失败 N 次后锁定该 IP
 LOGIN_LOCK_SEC = 900          # 锁定 15 分钟
 _login_fails = {}             # ip -> [连续失败次数, 锁定截止时间戳]
@@ -115,8 +116,8 @@ def _ensure_auth():
     save_config()
 
 
-def _make_session():
-    exp = int(time.time()) + SESSION_DAYS * 86400
+def _make_session(days=SESSION_DAYS):
+    exp = int(time.time()) + days * 86400
     msg = str(exp)
     sig = hmac.new(CONFIG["auth_secret"].encode(), msg.encode(), hashlib.sha256).hexdigest()
     return f"{msg}.{sig}"
@@ -621,7 +622,7 @@ MANIFEST = {
 }
 
 SW_JS = """\
-const CACHE = "tvtimer-v2";
+const CACHE = "tvtimer-v3";
 const SHELL = ["/manifest.webmanifest", "/icon.svg"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL).catch(() => {})).then(() => self.skipWaiting()));
@@ -632,9 +633,10 @@ self.addEventListener("activate", e => {
 self.addEventListener("fetch", e => {
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin) return;
-  // 页面与数据始终走网络，保证更新即时生效；仅静态资源参与缓存
-  if (url.pathname === "/tv_control.html" || url.pathname === "/" || url.pathname === "/index.html"
-      || url.pathname === "/status" || url.pathname === "/config") return;
+  // 只缓存静态外壳资源（manifest / icon）。
+  // 页面、登录页、状态与配置接口一律直连网络：
+  //   旧版把 /login 也缓存了，导致手机 PWA 一直拿到没有免验证逻辑的旧登录页。
+  if (url.pathname !== "/manifest.webmanifest" && url.pathname !== "/icon.svg") return;
   e.respondWith(
     caches.match(e.request).then(r =>
       r || fetch(e.request).then(resp => {
@@ -678,28 +680,52 @@ LOGIN_HTML = """\
   .box{background:#fff;border:1px solid #e3e8ef;border-radius:14px;padding:28px 24px;width:min(360px,90vw);
     box-shadow:0 1px 2px rgba(16,24,40,.06)}
   h1{font-size:18px;margin:0 0 16px;color:#1f2933}
-  input{width:100%;font-size:16px;padding:12px;border:1px solid #e3e8ef;border-radius:10px;box-sizing:border-box}
-  input:focus{outline:none;border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
+  input[type=password]{width:100%;font-size:16px;padding:12px;border:1px solid #e3e8ef;border-radius:10px;box-sizing:border-box}
+  input[type=password]:focus{outline:none;border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
+  .remember{display:flex;align-items:center;gap:8px;font-size:13px;color:#1f2933;margin-top:12px;cursor:pointer}
+  .remember input{width:16px;height:16px;accent-color:#1f6feb}
   button{width:100%;margin-top:14px;border:none;border-radius:10px;background:#1f6feb;color:#fff;
     font-size:15px;font-weight:600;padding:12px;cursor:pointer}
   .err{color:#e5484d;font-size:13px;margin-top:10px;min-height:18px}
+  .hint{color:#6b7785;font-size:12px;margin-top:10px;line-height:1.5}
 </style>
 </head>
 <body>
 <div class="box">
   <h1>电视管控 · 管理登录</h1>
   <input type="password" id="pw" placeholder="管理密码" autocomplete="current-password">
+  <label class="remember"><input type="checkbox" id="remember" checked>记住本机（免验证，下次自动登录）</label>
   <button id="go">登 录</button>
   <div class="err" id="err"></div>
+  <div class="hint">勾选「记住本机」后，登录凭证会保存在本机浏览器（localStorage，非明文密码），下次打开自动续期，无需再输密码。换设备或清缓存后需重新登录。</div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
+// 即使停在登录页也要注册 SW：否则旧 SW 缓存的登录页会一直霸占，新逻辑无从生效
+if("serviceWorker" in navigator){
+  navigator.serviceWorker.register("/sw.js").catch(()=>{});
+}
+// 自动登录：若本机已保存 token，则静默续期 cookie 后进入主界面（免验证）
+(async ()=>{
+  let tok=null;
+  try{ tok=localStorage.getItem("tvtimer_token"); }catch(e){}
+  if(!tok) return;
+  try{
+    const r=await fetch("/auto_login",{method:"POST",headers:{"Authorization":"Bearer "+tok}});
+    if(r.ok){ location.replace("/"); return; }
+    if(r.status===401){ try{ localStorage.removeItem("tvtimer_token"); }catch(e){} }
+  }catch(e){}
+})();
 async function go(){
   $("go").disabled=true; $("err").textContent="";
   try{
     const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({password:$("pw").value})});
-    if(r.ok){location.href="/";return;}
+      body:JSON.stringify({password:$("pw").value, remember:$("remember").checked})});
+    if(r.ok){
+      const j=await r.json().catch(()=>({}));
+      if(j.token){ try{ localStorage.setItem("tvtimer_token", j.token); }catch(e){} }
+      location.href="/"; return;
+    }
     const j=await r.json().catch(()=>({}));
     $("err").textContent=j.error||("登录失败("+r.status+")");
   }catch(e){$("err").textContent="网络错误";}
@@ -748,7 +774,13 @@ class Handler(BaseHTTPRequestHandler):
         return m.value if m else None
 
     def _authed(self):
-        return _check_session(self._session_token())
+        # 优先校验 Cookie 会话；再回退到 Bearer token（本机「记住我」凭证，存于 localStorage）
+        if _check_session(self._session_token()):
+            return True
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            return _check_session(auth.split(" ", 1)[1].strip())
+        return False
 
     def _client_ip(self):
         return self.client_address[0] if self.client_address else "?"
@@ -757,19 +789,58 @@ class Handler(BaseHTTPRequestHandler):
         cnt, lock_until = _login_fails.get(self._client_ip(), (0, 0.0))
         return max(0.0, lock_until - time.time())
 
-    def _set_session_cookie(self, token, clear=False):
+    def _set_session_cookie(self, token, clear=False, days=SESSION_DAYS):
         proto = (self.headers.get("X-Forwarded-Proto") or "").lower()
         secure = "; Secure" if proto == "https" else ""
+        # SameSite=Lax（不是 Strict）：
+        #   Strict 模式下，PWA（安装到桌面/WebAPK）从桌面图标启动的导航属于
+        #   cross-site 发起，Chrome 不会附带 Strict cookie -> 每次启动都被判未登录。
+        #   Lax 在「顶级 GET 导航」时仍会携带 cookie，正好覆盖 PWA 启动场景；
+        #   跨站 POST 不携带，CSRF 防护不降级（所有写操作都是 POST + JSON）。
         if clear:
-            cookie = "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" + secure
+            cookie = "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + secure
         else:
-            cookie = (f"session={token}; Path=/; HttpOnly; SameSite=Strict; "
-                      f"Max-Age={SESSION_DAYS*86400}" + secure)
+            cookie = (f"session={token}; Path=/; HttpOnly; SameSite=Lax; "
+                      f"Max-Age={days*86400}" + secure)
         return [("Set-Cookie", cookie)]
 
     def do_GET(self):
         path = urlparse(self.path).path
+
+        # ---- 公开资源（不含敏感信息）----
+        # 必须放在鉴权之前：未登录时 /sw.js 若返回 401，Service Worker 装不上，
+        # PWA 就永远用不到新的免验证逻辑；manifest / icon 同理。
+        if path == "/manifest.webmanifest":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/manifest+json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(json.dumps(MANIFEST, ensure_ascii=False).encode("utf-8"))
+            return
+        if path == "/sw.js":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(SW_JS.encode("utf-8"))
+            return
+        if path == "/icon.svg":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(ICON_SVG.encode("utf-8"))
+            return
+
         if path == "/login":
+            # 已持有有效会话时直接回主页，不再显示密码框（PWA 冷启动场景）
+            if self._authed():
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
             self._send_html(LOGIN_HTML)
             return
         if not self._authed():
@@ -789,23 +860,6 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/config":
             with config_lock:
                 self._send_json({k: CONFIG[k] for k in ALLOWED_KEYS})
-        elif path == "/manifest.webmanifest":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/manifest+json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps(MANIFEST, ensure_ascii=False).encode("utf-8"))
-        elif path == "/sw.js":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/javascript; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(SW_JS.encode("utf-8"))
-        elif path == "/icon.svg":
-            self.send_response(200)
-            self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(ICON_SVG.encode("utf-8"))
         else:
             self._send_json({"error": "unknown path"}, 404)
 
@@ -823,6 +877,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             pw = str(data.get("password", ""))
+            remember = bool(data.get("remember", False))
             if not _verify_password(pw):
                 ip = self._client_ip()
                 cnt, _ = _login_fails.get(ip, (0, 0.0))
@@ -833,7 +888,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "密码错误"}, 401)
                 return
             _login_fails.pop(self._client_ip(), None)
-            self._send_json({"ok": True}, extra_headers=self._set_session_cookie(_make_session()))
+            days = REMEMBER_DAYS if remember else SESSION_DAYS
+            tok = _make_session(days)
+            resp = {"ok": True}
+            if remember:
+                resp["token"] = tok   # 仅在勾选「记住本机」时把 token 返回前端存储
+            self._send_json(resp, extra_headers=self._set_session_cookie(tok, days=days))
+            return
+
+        if path == "/auto_login":
+            # 本机「记住我」静默续期：校验 localStorage 中的 Bearer token，成功则重发 Cookie
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                tok = auth.split(" ", 1)[1].strip()
+                if _check_session(tok):
+                    self._send_json({"ok": True}, extra_headers=self._set_session_cookie(tok))
+                    return
+            self._send_json({"ok": False, "error": "invalid or expired token"}, 401)
             return
 
         if path == "/set_password":
