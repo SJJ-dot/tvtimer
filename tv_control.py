@@ -196,6 +196,16 @@ def power_off():
     return False
 
 
+def _round_sec(minutes):
+    """把分钟数归整到「秒」精度，消除浮点累加误差。
+
+    watched_gross_min 由逐次 (now-last)/60.0 累加而来，带 IEEE754 误差；
+    若结余直接继承这些脏值，会逐日沉淀放大成 149.9190133213997 分这类数字。
+    归整到秒（1/60 分）既消除误差，又保留亚分钟精度。
+    """
+    return round(float(minutes) * 60) / 60.0
+
+
 def hhmm_to_min(s):
     h, m = str(s).split(":")
     h, m = int(h), int(m)
@@ -385,7 +395,7 @@ class TvGuard:
                 self.cycle_day_key = st["cycle_day_key"]
                 self.watched_gross_min = max(0.0, float(st.get("watched_gross_min", 0.0)))
                 self.rest_credit_min = max(0.0, float(st.get("rest_credit_min", 0.0)))
-                self.carry_min = max(0.0, float(st.get("carry_min", 0.0)))
+                self.carry_min = _round_sec(max(0.0, float(st.get("carry_min", 0.0))))
                 self.total_blocked = bool(st.get("total_blocked", False))
                 self.rest_until = float(st.get("rest_until", 0.0))
                 self.last_view_end_ts = float(st.get("last_view_end_ts", 0.0))
@@ -446,7 +456,11 @@ class TvGuard:
                          else CONFIG["weekend_total_min"])
             if prev_base > 0:
                 # 昨日可用 = 昨日基准 + 结余；未用完部分滚入结余
-                self.carry_min = max(0.0, prev_base + self.carry_min - self.watched_gross_min)
+                # 取整到「秒」再折算分钟：watched_gross_min 由逐次 delta 累加而来，
+                # 带 IEEE754 浮点误差；若不归整，脏值会被结余继承并逐日沉淀放大，
+                # 最终出现 149.9190133213997 分这类脏数字。
+                carry = max(0.0, prev_base + self.carry_min - self.watched_gross_min)
+                self.carry_min = _round_sec(carry)
             # 昨日不限额(基准0)时无「未用完」概念，结余保持不变
             self.cycle_day_key = day_key
             self.watched_gross_min = 0.0
@@ -587,7 +601,9 @@ class TvGuard:
             "rest_min": CONFIG["rest_min"],
             "disabled_windows": CONFIG["disabled_windows"],
             "last_action": self.last_action,
-            "daily_cap_min": daily_cap,
+            # daily_cap_min 也要归整：它是 base + carry 直接相加，
+            # 未取整时前端会显示 149.9190133213997 分这类浮点尾数
+            "daily_cap_min": _round_sec(daily_cap) if daily_cap > 0 else daily_cap,
             "daily_base_min": (CONFIG["weekday_total_min"] if is_weekday(now)
                                else CONFIG["weekend_total_min"]),
             "carry_min": round(max(0.0, self.carry_min), 1),

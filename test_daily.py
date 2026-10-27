@@ -136,4 +136,44 @@ assert snap["daily_cap_min"] == 60
 assert snap["rest_remaining_sec"] is not None
 print("7) snapshot 无次数字段、含 daily_cap_min OK")
 
+# ============ 8) 浮点精度：结余/额度不得出现浮点尾数 ============
+# 回归问题：watched_gross_min 逐次 delta 累加带 IEEE754 误差，
+# 跨天结转时 carry 直接继承，脏值逐日沉淀，
+# 最终 daily_cap_min 显示为 149.9190133213997 分。
+#
+# 说明：本文件的 mock 把 M.time.time 换掉了，但 time.strftime 仍走真实时钟，
+# 导致 cycle_day_key 判定不成立、跨天分支无法在这里触发。
+# 因此本用例直接构造结转场景，验证 _round_sec 与结转公式的归整效果。
+reset()
+M.CONFIG["weekday_total_min"] = 60
+M.CONFIG["weekend_total_min"] = 120
+
+# 模拟一天：5 秒步长累加 30 分钟观看（与真实运行一致的浮点误差来源）
+watched = 0.0
+t = 1_000_000.0
+for _ in range(360):
+    t2 = t + 5.0
+    watched += (t2 - t) / 60.0
+    t = t2
+assert watched != 30.0, "前置条件：累加结果应带浮点误差"
+assert watched != round(watched, 1), f"前置条件：应有浮点尾数 {watched!r}"
+
+# 跨天结转：carry = prev_base + carry - watched，归整到秒
+g.carry_min = M._round_sec(max(0.0, 120 + 0.0 - watched))
+assert g.carry_min == M._round_sec(g.carry_min), \
+    f"结余应已归整到秒精度: {g.carry_min!r}"
+assert len(str(g.carry_min).split(".")[-1]) <= 6, \
+    f"结余不应有长浮点尾数: {g.carry_min!r}"
+# 归整后与真值偏差 < 1 秒
+assert abs(g.carry_min - 90.0) < 1.0 / 60, \
+    f"归整后误差应 <1秒: {g.carry_min!r}"
+
+# snapshot 的 daily_cap_min 同样必须归整（前端直接拼进文本）
+g.watched_gross_min = 0.0
+snap = g.snapshot()
+cap = snap["daily_cap_min"]
+assert cap == M._round_sec(cap), f"daily_cap_min 应已归整: {cap!r}"
+assert len(str(cap).split(".")[-1]) <= 6, f"daily_cap_min 尾数过长: {cap!r}"
+print(f"8) 浮点精度 OK (carry={g.carry_min!r}, cap={cap!r})")
+
 print("\nALL DAILY TESTS PASSED, 关机事件=", len(offs))
