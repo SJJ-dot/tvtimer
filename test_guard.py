@@ -157,15 +157,26 @@ assert M._clamp_rest_base(0) == 1
 assert M._clamp_rest_base(99999) == 600
 print("G) 单次上限硬顶 30 / 休息基准下限 1 OK")
 
-# ============ H) 快照：无强制休息倒计时、模式语义正确 ============
+# ============ H) 快照：模式语义 + 网页展示字段口径 ============
 reset()
 snap = g.snapshot()
 assert "rest_remaining_sec" not in snap, "不应再有强制休息倒计时"
 assert "auth" not in str(snap).lower()
 watch(30)
-assert g.snapshot()["mode"] == "resting", "净已看顶格应为 resting"
+snap = g.snapshot()
+assert snap["mode"] == "resting", "净已看顶格应为 resting"
+assert snap["tv_online"] is True, "在线探测结果应写入快照"
+assert snap["net_watched_sec"] + snap["watch_remaining_sec"] == 30 * 60, "净已看+还可看应恒等于上限"
+assert snap["rest_to_full_sec"] == 30 * 60, "1:1 时净已看 30 分 -> 需休息 30 分回满"
 rest(10)
-assert g.snapshot()["mode"] == "recovering", "休息抵扣中应为 recovering"
-print("H) snapshot 无 rest_remaining_sec，resting/recovering 语义正确 OK")
+snap = g.snapshot()
+assert snap["mode"] == "recovering", "休息抵扣中应为 recovering"
+assert snap["tv_online"] is False, "离线探测结果应写入快照"
+assert snap["net_watched_sec"] + snap["watch_remaining_sec"] == 30 * 60
+assert snap["rest_to_full_sec"] == 20 * 60, "净已看 20 分 -> 需休息 20 分回满"
+M.CONFIG["rest_min"] = 60               # 比例 0.5：休息 2 分钟才刷新 1 分钟
+assert g.snapshot()["rest_to_full_sec"] == 40 * 60, "净已看 20 分、0.5 比例 -> 需休息 40 分回满"
+M.CONFIG["rest_min"] = 30
+print("H) snapshot 模式/在线状态/秒级互补/回满所需休息时长 OK")
 
 print("\nALL GUARD TESTS PASSED, 关机事件=", len(offs), "发生在:", offs)

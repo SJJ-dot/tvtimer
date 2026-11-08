@@ -51,11 +51,18 @@ try:
 
     # 1) 无登录直接访问主页 / 状态 / 配置
     code, _, body = req("/")
-    assert code == 200 and "电视管控" in body.decode("utf-8"), code
+    page = body.decode("utf-8")
+    assert code == 200 and "电视管控" in page, code
+    assert "已刷新" not in page and 'id="s-tip"' not in page, "状态卡片不应再有长说明文案"
+    assert 'id="s-ip"' not in page and 'class="meta"' not in page, "状态卡片不应再有元信息标签行"
+    assert "电视离线" not in page and "今日按" not in page, "在线状态/额度类型的重复标签应已删除"
     code, _, body = req("/status")
     s = json.loads(body)
     assert code == 200 and "mode" in s, (code, body)
     assert "rest_remaining_sec" not in s, "不应再有强制休息倒计时"
+    for k in ("tv_online", "net_watched_sec", "rest_to_full_sec"):
+        assert k in s, k
+    assert s["net_watched_sec"] + s["watch_remaining_sec"] == s["max_watch_min"] * 60
     code, _, body = req("/config")
     c = json.loads(body)
     assert code == 200 and "max_watch_min" in c, c
@@ -109,8 +116,8 @@ try:
         code, _, _ = req(p)
         assert code == 200, (p, code)
     code, _, body = req("/sw.js")
-    assert 'CACHE = "tvtimer-v5"' in body.decode(), "SW 缓存版本应升级"
-    print("6) PWA 静态资源公开 + SW tvtimer-v5 OK")
+    assert 'CACHE = "tvtimer-v6"' in body.decode(), "SW 缓存版本应升级"
+    print("6) PWA 静态资源公开 + SW tvtimer-v6 OK")
 
     # 7) 启动日志不再生成/打印随机密码
     with open(log_path, encoding="utf-8") as f:

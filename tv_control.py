@@ -23,7 +23,7 @@
 网页:
   脚本同时提供 HTTP 服务，浏览器打开 http://<本机IP>:<port>/ 即可：
     - 可视化设置以上参数（手机适配）
-    - 实时查看电视状态（禁用中 / 净已看 / 还可看 / 今日已看时长）
+    - 实时查看状态说明与两条额度进度条（本次净已看 / 今日总时长 / 休息刷新）
     - 支持「安装到桌面」（PWA：manifest + service worker）
   配置保存在同目录 tv_control_config.json（容器用 DATA_DIR 指向挂载卷），重启后自动加载。
 
@@ -326,6 +326,7 @@ class TvGuard:
         self.cycle_day_key = time.strftime("%Y-%m-%d")
         self.lock = threading.Lock()
         self.last_action = "idle"
+        self.tv_online = False        # 最近一次探测到的电视在线状态（供网页显示，避免用 mode 反推）
         self._last_save = 0.0
 
     # ---------- 观看状态持久化（升级/重启不丢当天观看时长） ----------
@@ -485,6 +486,7 @@ class TvGuard:
             print(f"[{logts()}] 跨天，今日观看已重置；结余时长 {self.carry_min:.0f} 分钟")
 
         with self.lock:
+            self.tv_online = alive
             if disabled:
                 if alive:
                     self._try_off("禁用时段(电视不应开机)")
@@ -577,11 +579,22 @@ class TvGuard:
             base_auto = (CONFIG["weekday_total_min"] if is_weekday(now)
                          else CONFIG["weekend_total_min"])
             remaining_cycle = max(0.0, mx - net)
+            online = self.tv_online
+        # 网页展示用：净已看秒数 + 还可看秒数恒等于单次上限，避免出现
+        # 「净已看 15 分 / 还可看 14分45秒」这种看着自相矛盾的组合。
+        remain_sec = int(remaining_cycle * 60)
+        # 还要休息多久才能把「净已看」抵扣到 0（即本次额度回满）：
+        # 需新增抵扣 net 分钟，抵扣速率 ratio 分钟/休息分钟 -> 休息 net/ratio 分钟。
+        # 注意不能用 remaining_cycle（那是还可看时长，方向相反）。
+        rest_to_full_sec = int(net / ratio * 60) if ratio > 0 else 0
         return {
             "tv_ip": CONFIG["tv_ip"],
+            "tv_online": online,
             "disabled_now": disabled,
             "workday_today": is_weekday(now),
             "mode": mode,
+            "net_watched_sec": int(round(mx * 60)) - remain_sec,
+            "rest_to_full_sec": rest_to_full_sec,
             # 统计口径：关机后四舍五入为整数分钟，前端不再出现 29.999999999999844
             "net_watched_min": _round_min_int(net),
             "watched_gross_min": _round_min_int(self.watched_gross_min),
@@ -631,7 +644,7 @@ MANIFEST = {
 }
 
 SW_JS = """\
-const CACHE = "tvtimer-v5";
+const CACHE = "tvtimer-v6";
 const SHELL = ["/manifest.webmanifest", "/icon.svg"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL).catch(() => {})).then(() => self.skipWaiting()));
