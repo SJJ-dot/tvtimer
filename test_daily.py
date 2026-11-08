@@ -1,7 +1,8 @@
-"""每日总时长（工作日/休息日）/ 重置休息 验证（mock 时钟/电视）。
+"""每日总时长（工作日/非工作日）/ 按比例休息刷新 / 结余滚存 验证（mock 时钟/电视）。
 
-语义：工作日/休息日分别设「每天可看总时长（毛分钟）」，只按实际观看时间计，
-与开关机次数无关；达上限当天封禁（total_blocked），次日重置，重置休息不解除。
+语义：工作日/非工作日分别设「每天可看总时长（毛分钟）」，只按实际观看时间计，
+与开关机次数无关；达上限当天封禁（total_blocked），次日重置，休息不能解除；
+休息只影响「净已看」，不减少今日毛观看；无登录认证、无强制休息闸门、无重置后门。
 """
 import os
 import tempfile
@@ -94,33 +95,36 @@ assert g._daily_cap(fake_now[0]) == 0
 M.CONFIG["weekday_total_min"] = 60
 print("3) 0=不限制 OK")
 
-# ============ 4) 上限用完后「重置休息」不解除（硬上限） ============
+# ============ 4) 上限用完后休息不解除（硬上限，无重置后门） ============
+M.CONFIG["max_watch_min"] = 30
 M.CONFIG["weekday_total_min"] = 30     # 上限=30
 reset()
 watch(30)                              # 单次上限强制关机，毛=30=上限
 rest(40)                               # 抵扣回满
 on(); g.tick()                         # 开机 -> 上限检查 -> 封禁
 assert g.total_blocked, "上限用完应封禁"
-g.reset_rest()
-assert g.total_blocked, "重置休息不解除当日上限"
-assert g._net() == 0, "重置后净应归零"
+assert g._net() == 0, "休息后净已看应归零"
+assert not hasattr(g, "reset_rest"), "不应存在「重置休息」后门"
+rest(10)                               # 再休息也不解除当日硬上限
+assert g.total_blocked, "休息不解除当日上限"
 n = len(offs)
 on(); g.tick()                         # 再开 -> 仍被封禁关机
-assert len(offs) > n, "重置后再开仍应被关机"
-print("4) 封禁后重置休息不解除（次日自动恢复） OK")
+assert len(offs) > n, "封禁后再开仍应被关机"
+print("4) 封禁后休息不解除、无重置休息后门 OK")
 
-# ============ 5) 跨「重置休息」总时长继续累计 ============
-M.CONFIG["max_watch_min"] = 999
+# ============ 5) 跨休息总时长继续累计（休息不减少今日已看） ============
+M.CONFIG["max_watch_min"] = 999        # 测试内部绕过配置入口，隔离单次上限
 M.CONFIG["weekday_total_min"] = 60
 reset()
 watch(30)
 assert abs(g.watched_gross_min - 30) < 1e-6, g.watched_gross_min
-g.reset_rest()
-assert abs(g._net() - 0) < 1e-6, "重置后净应归零（立即可看）"
+rest(40)                               # 抵扣把净已看压到 0，但毛观看不动
+assert abs(g._net()) < 1e-6, "休息后净已看应归零"
+assert abs(g.watched_gross_min - 30) < 1e-6, "休息不能减少今日已看时间"
 watch(30)
-assert abs(g.watched_gross_min - 60) < 1e-6, f"跨重置应计60, {g.watched_gross_min}"
+assert abs(g.watched_gross_min - 60) < 1e-6, f"跨休息应计60, {g.watched_gross_min}"
 assert g.total_blocked, "60 达上限 60 应封禁"
-print("5) 看30→重置→再看30，总时长累计=60并封禁 OK")
+print("5) 看30→休息→再看30，总时长累计=60并封禁（休息不减毛观看） OK")
 
 # ============ 6) 网络抖动不误扣总时长 ============
 M.CONFIG["max_watch_min"] = 30
@@ -139,8 +143,9 @@ snap = g.snapshot()
 assert "sessions_today" not in snap and "session_limit" not in snap
 assert "daily_total_min" not in snap
 assert snap["daily_cap_min"] == 60
-assert snap["rest_remaining_sec"] is not None
-print("7) snapshot 无次数字段、含 daily_cap_min OK")
+assert "rest_remaining_sec" not in snap, "不应再有强制休息倒计时"
+assert "auth" not in str(snap).lower()
+print("7) snapshot 无次数/倒计时/认证字段、含 daily_cap_min OK")
 
 # ============ 8) 关机后统计四舍五入为整数 ============
 # 需求：关机后「今日已看」等统计显示为整数分钟，不出现 29.999999999999844 这类尾数。

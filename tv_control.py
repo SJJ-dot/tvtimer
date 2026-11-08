@@ -3,22 +3,27 @@
 """
 小米电视 管控脚本 (家长控制 / 观看时限) + 配置网页服务
 ========================================================
-功能:
-  1) 禁用时段：多个时间段，时段内电视若开机则自动关机（发现开机即关）。
-  2) 净观看时长按「观看−休息抵扣」累计：净已看 = 累计观看 − 累计休息×抵扣比例。
-     抵扣比例 = 单次最长观看 / 单次休息（休息满「单次休息」分钟即抵扣回满额度）。
-     例（默认30/40）：看20休10 -> 净已看 20−10*0.75=12.5 分钟；若二者相等则 1:1（20−10=10）。
-     跨「关一下再开」不会清零，因此「看20→关1→又看」无法凭空多放时间（防卡 BUG）。
-  3) 强制休息时长：强制关机后须休息指定时长（如 40 分钟）才能再开机，
-     休息期间被发现开机同样自动关机。可手动「重置休息」立即清零抵扣、立即可看。
-  4) 每日总时长：工作日/非工作日分别设「每天可看总时长（分钟）」，只按实际观看时间计
+规则:
+  1) 单次观看不能超过 30 分钟（硬上限，配置值收敛到 1..30）：
+     净已看 = clamp(今日累计观看 − 休息抵扣, 0, 单次上限)。
+     净已看达到上限即自动关机，必须靠真实关机休息把净已看降下来才能再看。
+  2) 休息按比例刷新观看时长：
+     刷新速度 = 单次观看上限 / 休息基准时长 (max_watch_min / rest_min)。
+     例：30/30 = 1:1（休 10 分钟刷新 10 分钟）；30/60 = 1:2（休 2 分钟刷新 1 分钟）。
+     不要求休息满某个时长，随时可以开机，只放行实际折算出的额度；
+     跨「关一下再开」不会清零，因此无法凭空多放时间（防卡 BUG）。
+     rest_min 只是换算比例的基准，不是强制休息闸门。
+  3) 每日总时长：工作日/非工作日分别设基准总时长（毛分钟），只按实际观看时间计
      （与开关机次数无关），达额度当天封禁，次日自动恢复；0 = 不限制。
-     工作日/休息日按法定节假日判定（holiday-cn 数据，每月自动更新，离线回退星期几）。
+     工作日/非工作日按法定节假日判定（holiday-cn 数据，每月自动更新，离线回退星期几）。
+     当天没看完的额度结余到次日，余额滚存、可无限累计，网页可手动调整。
+  4) 禁用时段：多个时间段，时段内电视若开机则自动关机；禁用时段不计休息抵扣。
+  5) 无登录认证：打开即用。若要暴露公网，请在反向代理 / Cloudflare Access 层做访问控制。
 
 网页:
   脚本同时提供 HTTP 服务，浏览器打开 http://<本机IP>:<port>/ 即可：
     - 可视化设置以上参数（手机适配）
-    - 实时查看电视状态（禁用中 / 观看剩余 / 休息剩余 / 今日已看时长）
+    - 实时查看电视状态（禁用中 / 净已看 / 还可看 / 今日已看时长）
     - 支持「安装到桌面」（PWA：manifest + service worker）
   配置保存在同目录 tv_control_config.json（容器用 DATA_DIR 指向挂载卷），重启后自动加载。
 
@@ -32,15 +37,11 @@
 """
 
 import argparse
-import hashlib
-import hmac
 import json
 import os
-import secrets
 import threading
 import time
 import urllib.request
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -50,7 +51,7 @@ CONFIG = {
     "tv_port": 6095,
     "poll_interval": 5,
     "max_watch_min": 30,
-    "rest_min": 40,
+    "rest_min": 30,            # 休息基准时长：与 max_watch_min 共同决定刷新比例（30/30=1:1）
     "weekday_total_min": 60,   # 工作日每天可看总时长（毛分钟）；0 = 不限制
     "weekend_total_min": 120,  # 非工作日每天可看总时长（毛分钟）；0 = 不限制
     "off_cooldown_sec": 10,
@@ -78,68 +79,23 @@ CARRY_STATE_VERSION = 2
 
 ALLOWED_KEYS = {"tv_ip", "tv_port", "poll_interval", "max_watch_min", "rest_min",
                 "weekday_total_min", "weekend_total_min", "disabled_windows"}
-# 认证相关键：落盘但不通过 GET /config 返回给前端
-AUTH_KEYS = {"auth_secret", "auth_salt", "auth_password_hash"}
-PBKDF2_ITER = 120_000
-SESSION_DAYS = 30            # 普通会话有效期（天）
-REMEMBER_DAYS = 365         # 勾选「记住本机」后的免验证有效期（天）
-LOGIN_LOCK_FAILS = 5          # 连续失败 N 次后锁定该 IP
-LOGIN_LOCK_SEC = 900          # 锁定 15 分钟
-_login_fails = {}             # ip -> [连续失败次数, 锁定截止时间戳]
+MAX_SESSION_MIN = 30           # 单次观看硬上限：配置入口一律收敛到 1..30
+MIN_REST_MIN = 1               # 休息基准下限，保证抵扣比例不会除零或为 0
 
 
-def _hash_password(pw, salt_hex):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
-                               bytes.fromhex(salt_hex), PBKDF2_ITER).hex()
-
-
-def _verify_password(pw):
-    salt, h = CONFIG.get("auth_salt"), CONFIG.get("auth_password_hash")
-    if not salt or not h:
-        return False
-    return hmac.compare_digest(_hash_password(pw, salt), h)
-
-
-def _set_password(pw):
-    salt = secrets.token_hex(16)
-    with config_lock:
-        CONFIG["auth_salt"] = salt
-        CONFIG["auth_password_hash"] = _hash_password(pw, salt)
-
-
-def _ensure_auth():
-    """启动时初始化认证：无密码则随机生成并在日志打印（仅打印一次）。"""
-    with config_lock:
-        if not CONFIG.get("auth_secret"):
-            CONFIG["auth_secret"] = secrets.token_hex(32)
-    if not CONFIG.get("auth_password_hash"):
-        pw = secrets.token_urlsafe(6)   # 8 位随机密码
-        _set_password(pw)
-        print("\n" + "=" * 56, flush=True)
-        print(f"[认证] 首次启动已生成随机管理密码: {pw}", flush=True)
-        print("[认证] 请立即登录并在「设置-修改密码」中改掉！", flush=True)
-        print("=" * 56 + "\n", flush=True)
-    save_config()
-
-
-def _make_session(days=SESSION_DAYS):
-    exp = int(time.time()) + days * 86400
-    msg = str(exp)
-    sig = hmac.new(CONFIG["auth_secret"].encode(), msg.encode(), hashlib.sha256).hexdigest()
-    return f"{msg}.{sig}"
-
-
-def _check_session(token):
-    if not token:
-        return False
+def _clamp_session_cap(v):
+    """把单次观看上限收敛到 1..MAX_SESSION_MIN，非法值回退到默认 30。"""
     try:
-        msg, sig = token.split(".", 1)
-        exp = int(msg)
-        good = hmac.compare_digest(
-            sig, hmac.new(CONFIG["auth_secret"].encode(), msg.encode(), hashlib.sha256).hexdigest())
-        return good and exp > time.time()
-    except Exception:
-        return False
+        return max(1, min(MAX_SESSION_MIN, int(v)))
+    except (ValueError, TypeError):
+        return MAX_SESSION_MIN
+
+
+def _clamp_rest_base(v):
+    try:
+        return max(MIN_REST_MIN, min(600, int(v)))
+    except (ValueError, TypeError):
+        return 30
 
 
 def load_config():
@@ -148,7 +104,11 @@ def load_config():
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             with config_lock:
-                CONFIG.update({k: v for k, v in data.items() if k in ALLOWED_KEYS | AUTH_KEYS})
+                # 只接受白名单键：旧版本的认证键（auth_*）会被自动丢弃
+                CONFIG.update({k: v for k, v in data.items() if k in ALLOWED_KEYS})
+                # 旧配置里可能有大于 30 的单次上限 / 非法的休息基准，加载时收敛
+                CONFIG["max_watch_min"] = _clamp_session_cap(CONFIG["max_watch_min"])
+                CONFIG["rest_min"] = _clamp_rest_base(CONFIG["rest_min"])
             print(f"[config] 已从 {CONFIG_PATH} 加载配置")
         except Exception as e:
             print(f"[config] 读取 {CONFIG_PATH} 失败，使用默认: {e}")
@@ -156,7 +116,7 @@ def load_config():
 
 def save_config():
     with config_lock:
-        data = {k: CONFIG[k] for k in ALLOWED_KEYS | AUTH_KEYS}
+        data = {k: CONFIG[k] for k in ALLOWED_KEYS}
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -332,16 +292,17 @@ class TvGuard:
       - watched_gross_min : 今日累计观看分钟（毛，只增不减，跨天重置）
       - rest_credit_min  : 今日累计「休息抵扣」分钟 = 离线时长 × 抵扣比例
       - 抵扣比例 RATIO = max_watch_min / rest_min
-          （休息 rest_min 分钟，抵扣 max_watch_min 分钟观看；即「完整休息一次 = 额度回满」）
+          （休息 rest_min 分钟刷新 max_watch_min 分钟观看；rest_min 仅作比例基准）
       - 净已看 net = clamp(watched_gross_min - rest_credit_min, 0, max_watch_min)
-      - 电视开机时，已看就按 net 计；net 达到上限即强制关机并进入休息。
+      - net 达到上限即强制关机；之后只要电视仍在线就持续要求关机、不再计时。
+      - 休息不要求满时长：真实离线 N 分钟就按 N×RATIO 刷新额度，随时可开机，
+        只放行折算出来的剩余额度；没有强制休息闸门，也没有「重置休息」后门。
       - 防卡 BUG：看 20 分钟、关 1 分钟、又看，关的 1 分钟只抵扣 0.75 分钟，无法凭空多放时间。
       - 每日总时长：工作日 weekday_total_min / 非工作日 weekend_total_min（毛分钟，0=不限）。
         只按实际观看时间计，与开关机次数无关（网络抖动/探测误判不会误扣额度）。
         达额度当天封禁（total_blocked），次日重置。
+      - 结余余额滚存：今日结余 = 昨日(基准+结余) − 昨日已看，可无限累计，网页可手动调整。
       - 禁用时段内强制关机，且禁用时段不计休息抵扣（属惩罚，不算恢复）。
-      - 「重置休息」：把休息抵扣顶满（net→0）、清掉强制休息闸门，立即可看；
-        不解除「当日总时长封禁」（当天额度是硬上限，次日自动恢复）。
       - 每天本地零点重置（day_key 变更）。
     """
 
@@ -360,7 +321,6 @@ class TvGuard:
         self.last_on_ts = None        # 上一次确认电视在线且可观看的时间戳（累加观看用）
         self.last_view_end_ts = 0.0    # 上一次观看结束（电视离线）时间戳，用于判定是否为新一次
         self.last_off_ts = None       # 上一次确认电视离线的时间戳（累加抵扣用）
-        self.rest_until = 0.0         # 强制休息截止时间戳
         self.cooldown_until = 0.0     # 关机指令冷却（避免反复发 power 触发开关抖动）
         self.offline_count = 0
         self.cycle_day_key = time.strftime("%Y-%m-%d")
@@ -379,7 +339,6 @@ class TvGuard:
                     "carry_min": self.carry_min,
                     "carry_v": CARRY_STATE_VERSION,
                     "total_blocked": self.total_blocked,
-                    "rest_until": self.rest_until,
                     "last_view_end_ts": self.last_view_end_ts,
                 }
             tmp = STATE_PATH + ".tmp"
@@ -411,7 +370,6 @@ class TvGuard:
                 self.carry_min = _round_min_int(max(0.0, float(st.get("carry_min", 0.0))))
                 carry_ver = int(st.get("carry_v", 1))
                 self.total_blocked = bool(st.get("total_blocked", False))
-                self.rest_until = float(st.get("rest_until", 0.0))
                 self.last_view_end_ts = float(st.get("last_view_end_ts", 0.0))
             # 存量脏结余清理：carry_v < 2 的状态文件由旧公式写入，
             # 结余里叠了上一轮的结余（如工作日 60、昨天只看了 30，却存成 90）。
@@ -424,9 +382,7 @@ class TvGuard:
                     print(f"[state] 旧版结余已收敛: {before:.0f} -> {clamped:.0f} 分"
                           f"（可在网页手动调整结余）")
             print(f"[state] 已恢复今日观看状态: 毛观看 {self.watched_gross_min:.1f} 分, "
-                  f"抵扣 {self.rest_credit_min:.1f} 分, 结余 {self.carry_min:.0f} 分"
-                  + (f", 强制休息至 {time.strftime('%H:%M:%S', time.localtime(self.rest_until))}"
-                     if self.rest_until > time.time() else ""))
+                  f"抵扣 {self.rest_credit_min:.1f} 分, 结余 {self.carry_min:.0f} 分")
         except Exception as e:
             print(f"[state] 读取观看状态失败(忽略): {e}")
 
@@ -500,19 +456,6 @@ class TvGuard:
             self.last_action = reason
             print(f"[{logts()}] 关机 -> {reason}")
 
-    def reset_rest(self):
-        # 把休息抵扣顶满 -> 净已看归零；清掉强制休息闸门，立即可看。
-        # 不解除「当日总时长封禁」（total_blocked）：当天额度是硬上限，次日自动恢复。
-        with self.lock:
-            self.rest_credit_min = self.watched_gross_min
-            self.rest_until = 0.0
-            self.last_on_ts = None
-            self.last_view_end_ts = 0.0
-            self.last_off_ts = None
-            self.offline_count = 0
-            self.last_action = "手动重置(休息)"
-        print(f"[{logts()}] 已重置（净已看归零，可立即可看；当日总时长仍累计）")
-
     def tick(self):
         now = time.time()
         disabled = in_disabled_window(now)
@@ -538,7 +481,6 @@ class TvGuard:
             self.last_on_ts = None
             self.last_view_end_ts = 0.0
             self.last_off_ts = None
-            self.rest_until = 0.0
             self.offline_count = 0
             print(f"[{logts()}] 跨天，今日观看已重置；结余时长 {self.carry_min:.0f} 分钟")
 
@@ -552,56 +494,40 @@ class TvGuard:
 
             if alive:
                 self.offline_count = 0
-                # 强制休息未到 -> 仍关机，不开始新观看
-                if now < self.rest_until:
-                    self._try_off("强制休息中(未到休息时间)")
-                    self.last_on_ts = None
-                    return
-
-                starting = self.last_on_ts is None
-                if starting:
-                    is_new = (self.last_view_end_ts == 0.0) or (now - self.last_view_end_ts >= self._min_session_gap())
-                    if is_new:
-                        # 当日总时长检查（先于净已看检查，额度是更严的上限）：
-                        # 毛观看达上限 -> 当天封禁（只按时间计，与开关机次数无关）
-                        cap = self._daily_cap(now)
-                        if cap > 0 and self.watched_gross_min >= cap:
-                            self.total_blocked = True
-                            self._try_off(f"今日{cap}分钟已看完")
-                            self.last_on_ts = None
-                            return
-                        # 净已看仍顶格（如强制休息期间电视一直没真正关掉、抵扣为零）
-                        # -> 直接再关并重置休息（避免秒关体验）
-                        if self._net() >= CONFIG["max_watch_min"]:
-                            self._try_off("净观看仍满(未恢复)")
-                            self.rest_until = now + CONFIG["rest_min"] * 60
-                            self.last_on_ts = None
-                            return
-                        print(f"[{logts()}] 开始观看 (今日额度 {self._daily_cap(now) or '不限'} 分钟)")
-                        self.rest_until = 0.0
-                        self.last_on_ts = now
-                    else:
-                        # 同一观看片段的短暂中断（<最小间隔），继续累计
-                        self.rest_until = 0.0
-                        self.last_on_ts = now
-                else:
-                    # 累加本次观看时长
-                    delta = (now - self.last_on_ts) / 60.0
-                    if delta > 0:
-                        self.watched_gross_min += delta
-                    self.last_on_ts = now
-
-                # 当日总时长达上限 -> 关且今日封禁（先于净已看检查）
+                # 两个硬上限在每次在线探测的最前面统一拦截，短暂中断（<最小片段间隔）
+                # 也绕不过去。注意这里只判断「净已看是否顶格」，不设任何休息时长闸门：
+                # 只要真实离线让抵扣涨了一点，净已看降下来就能立刻按剩余额度继续看。
                 cap = self._daily_cap(now)
                 if cap > 0 and self.watched_gross_min >= cap:
                     self.total_blocked = True
                     self._try_off(f"今日{cap}分钟已看完")
                     self.last_on_ts = None
                     return
-                # 本次净已看达上限 -> 强制关机并进入休息
                 if self._net() >= CONFIG["max_watch_min"]:
-                    self._try_off(f"净观看已达 {CONFIG['max_watch_min']} 分钟")
-                    self.rest_until = now + CONFIG["rest_min"] * 60
+                    self._try_off("净已看已达上限，请关机休息")
+                    self.last_on_ts = None
+                    return
+
+                if self.last_on_ts is None:
+                    is_new = (self.last_view_end_ts == 0.0) or (now - self.last_view_end_ts >= self._min_session_gap())
+                    if is_new:
+                        print(f"[{logts()}] 开始观看 (今日额度 {cap or '不限'} 分钟)")
+                    # 同一观看片段的短暂中断（<最小间隔）继续累计，不另起日志
+                    self.last_on_ts = now
+                else:
+                    delta = (now - self.last_on_ts) / 60.0
+                    if delta > 0:
+                        self.watched_gross_min += delta
+                    self.last_on_ts = now
+
+                # 累加完立刻复检，到点即关机（今日额度优先，它是当天硬上限）
+                if cap > 0 and self.watched_gross_min >= cap:
+                    self.total_blocked = True
+                    self._try_off(f"今日{cap}分钟已看完")
+                    self.last_on_ts = None
+                    return
+                if self._net() >= CONFIG["max_watch_min"]:
+                    self._try_off(f"净观看已达 {CONFIG['max_watch_min']} 分钟，请休息")
                     self.last_on_ts = None
                     return
                 self.last_off_ts = None
@@ -633,23 +559,18 @@ class TvGuard:
             net = self._net()
             mx = CONFIG["max_watch_min"]
             ratio = self._ratio()
-            # 还需休息多久（net 已到上限时按抵扣比例反推：净已看/比例=回满所需分钟；rest_until 闸门优先）
-            if now < self.rest_until:
-                rest_rem = self.rest_until - now
-            elif net >= mx and ratio > 0:
-                rest_rem = net / ratio * 60
-            else:
-                rest_rem = 0.0
             if disabled:
                 mode = "disabled"
             elif self.total_blocked:
                 mode = "blocked"
-            elif now < self.rest_until:
+            elif net >= mx:
+                # 净已看顶格：继续要求关机，但没有「必须休息满 X 分钟」的闸门，
+                # 离线抵扣一旦把 net 降下来就随时可开（只放行折算出的额度）
                 mode = "resting"
             elif self.last_on_ts is not None:
                 mode = "watching"
             elif net > 0:
-                mode = "recovering"   # 离线休息抵扣中（非强制闸门，随时可打开电视）
+                mode = "recovering"   # 离线休息抵扣中，随时可打开电视
             else:
                 mode = "idle"
             daily_cap = self._daily_cap(now)
@@ -668,7 +589,6 @@ class TvGuard:
             "ratio": round(ratio, 3),
             "cycle_remaining_min": round(remaining_cycle, 1),
             "watch_remaining_sec": int(remaining_cycle * 60),
-            "rest_remaining_sec": int(rest_rem),
             "max_watch_min": CONFIG["max_watch_min"],
             "rest_min": CONFIG["rest_min"],
             "disabled_windows": CONFIG["disabled_windows"],
@@ -711,7 +631,7 @@ MANIFEST = {
 }
 
 SW_JS = """\
-const CACHE = "tvtimer-v3";
+const CACHE = "tvtimer-v5";
 const SHELL = ["/manifest.webmanifest", "/icon.svg"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL).catch(() => {})).then(() => self.skipWaiting()));
@@ -723,8 +643,7 @@ self.addEventListener("fetch", e => {
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin) return;
   // 只缓存静态外壳资源（manifest / icon）。
-  // 页面、登录页、状态与配置接口一律直连网络：
-  //   旧版把 /login 也缓存了，导致手机 PWA 一直拿到没有免验证逻辑的旧登录页。
+  // 页面、状态与配置接口一律直连网络，避免 PWA 缓存导致普通刷新看不到新版。
   if (url.pathname !== "/manifest.webmanifest" && url.pathname !== "/icon.svg") return;
   e.respondWith(
     caches.match(e.request).then(r =>
@@ -755,78 +674,6 @@ ICON_SVG = """\
 
 
 # ============================ HTTP 服务 ============================
-LOGIN_HTML = """\
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="robots" content="noindex,nofollow">
-<title>电视管控 · 登录</title>
-<style>
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-    background:#f5f7fa;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
-  .box{background:#fff;border:1px solid #e3e8ef;border-radius:14px;padding:28px 24px;width:min(360px,90vw);
-    box-shadow:0 1px 2px rgba(16,24,40,.06)}
-  h1{font-size:18px;margin:0 0 16px;color:#1f2933}
-  input[type=password]{width:100%;font-size:16px;padding:12px;border:1px solid #e3e8ef;border-radius:10px;box-sizing:border-box}
-  input[type=password]:focus{outline:none;border-color:#1f6feb;box-shadow:0 0 0 3px rgba(31,111,235,.15)}
-  .remember{display:flex;align-items:center;gap:8px;font-size:13px;color:#1f2933;margin-top:12px;cursor:pointer}
-  .remember input{width:16px;height:16px;accent-color:#1f6feb}
-  button{width:100%;margin-top:14px;border:none;border-radius:10px;background:#1f6feb;color:#fff;
-    font-size:15px;font-weight:600;padding:12px;cursor:pointer}
-  .err{color:#e5484d;font-size:13px;margin-top:10px;min-height:18px}
-  .hint{color:#6b7785;font-size:12px;margin-top:10px;line-height:1.5}
-</style>
-</head>
-<body>
-<div class="box">
-  <h1>电视管控 · 管理登录</h1>
-  <input type="password" id="pw" placeholder="管理密码" autocomplete="current-password">
-  <label class="remember"><input type="checkbox" id="remember" checked>记住本机（免验证，下次自动登录）</label>
-  <button id="go">登 录</button>
-  <div class="err" id="err"></div>
-  <div class="hint">勾选「记住本机」后，登录凭证会保存在本机浏览器（localStorage，非明文密码），下次打开自动续期，无需再输密码。换设备或清缓存后需重新登录。</div>
-</div>
-<script>
-const $=id=>document.getElementById(id);
-// 即使停在登录页也要注册 SW：否则旧 SW 缓存的登录页会一直霸占，新逻辑无从生效
-if("serviceWorker" in navigator){
-  navigator.serviceWorker.register("/sw.js").catch(()=>{});
-}
-// 自动登录：若本机已保存 token，则静默续期 cookie 后进入主界面（免验证）
-(async ()=>{
-  let tok=null;
-  try{ tok=localStorage.getItem("tvtimer_token"); }catch(e){}
-  if(!tok) return;
-  try{
-    const r=await fetch("/auto_login",{method:"POST",headers:{"Authorization":"Bearer "+tok}});
-    if(r.ok){ location.replace("/"); return; }
-    if(r.status===401){ try{ localStorage.removeItem("tvtimer_token"); }catch(e){} }
-  }catch(e){}
-})();
-async function go(){
-  $("go").disabled=true; $("err").textContent="";
-  try{
-    const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({password:$("pw").value, remember:$("remember").checked})});
-    if(r.ok){
-      const j=await r.json().catch(()=>({}));
-      if(j.token){ try{ localStorage.setItem("tvtimer_token", j.token); }catch(e){} }
-      location.href="/"; return;
-    }
-    const j=await r.json().catch(()=>({}));
-    $("err").textContent=j.error||("登录失败("+r.status+")");
-  }catch(e){$("err").textContent="网络错误";}
-  $("go").disabled=false;
-}
-$("go").addEventListener("click",go);
-$("pw").addEventListener("keydown",e=>{if(e.key==="Enter")go();});
-$("pw").focus();
-</script>
-</body>
-</html>
-"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -852,53 +699,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "tv_control.html not found"}, 404)
 
-    # ---------- 认证 ----------
-    def _session_token(self):
-        ck = SimpleCookie()
-        try:
-            ck.load(self.headers.get("Cookie", "") or "")
-        except Exception:
-            return None
-        m = ck.get("session")
-        return m.value if m else None
-
-    def _authed(self):
-        # 优先校验 Cookie 会话；再回退到 Bearer token（本机「记住我」凭证，存于 localStorage）
-        if _check_session(self._session_token()):
-            return True
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            return _check_session(auth.split(" ", 1)[1].strip())
-        return False
-
-    def _client_ip(self):
-        return self.client_address[0] if self.client_address else "?"
-
-    def _login_locked(self):
-        cnt, lock_until = _login_fails.get(self._client_ip(), (0, 0.0))
-        return max(0.0, lock_until - time.time())
-
-    def _set_session_cookie(self, token, clear=False, days=SESSION_DAYS):
-        proto = (self.headers.get("X-Forwarded-Proto") or "").lower()
-        secure = "; Secure" if proto == "https" else ""
-        # SameSite=Lax（不是 Strict）：
-        #   Strict 模式下，PWA（安装到桌面/WebAPK）从桌面图标启动的导航属于
-        #   cross-site 发起，Chrome 不会附带 Strict cookie -> 每次启动都被判未登录。
-        #   Lax 在「顶级 GET 导航」时仍会携带 cookie，正好覆盖 PWA 启动场景；
-        #   跨站 POST 不携带，CSRF 防护不降级（所有写操作都是 POST + JSON）。
-        if clear:
-            cookie = "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + secure
-        else:
-            cookie = (f"session={token}; Path=/; HttpOnly; SameSite=Lax; "
-                      f"Max-Age={days*86400}" + secure)
-        return [("Set-Cookie", cookie)]
-
     def do_GET(self):
         path = urlparse(self.path).path
 
-        # ---- 公开资源（不含敏感信息）----
-        # 必须放在鉴权之前：未登录时 /sw.js 若返回 401，Service Worker 装不上，
-        # PWA 就永远用不到新的免验证逻辑；manifest / icon 同理。
+        # ---- PWA 静态资源 ----
+        # 页面、状态与配置接口一律直连网络（no-store / no-cache），
+        # 避免 PWA 缓存导致普通刷新看不到新版页面。
         if path == "/manifest.webmanifest":
             self.send_response(200)
             self.send_header("Content-Type", "application/manifest+json; charset=utf-8")
@@ -923,26 +729,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(ICON_SVG.encode("utf-8"))
             return
 
-        if path == "/login":
-            # 已持有有效会话时直接回主页，不再显示密码框（PWA 冷启动场景）
-            if self._authed():
-                self.send_response(302)
-                self.send_header("Location", "/")
-                self.end_headers()
-                return
-            self._send_html(LOGIN_HTML)
-            return
-        if not self._authed():
-            if path in ("/", "/index.html"):
-                self.send_response(302)
-                self.send_header("Location", "/login")
-                self.end_headers()
-            else:
-                self._send_json({"error": "unauthorized"}, 401)
-            return
-        if path == "/logout":
-            self._send_json({"ok": True}, extra_headers=self._set_session_cookie("", clear=True))
-        elif path in ("/", "/index.html"):
+        if path in ("/", "/index.html"):
             self._send_html()
         elif path == "/status":
             self._send_json(guard.snapshot())
@@ -954,70 +741,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path == "/login":
-            # 登录：每 IP 连续失败 5 次锁定 15 分钟（防暴力破解/PBKDF2 消耗 CPU）
-            locked = self._login_locked()
-            if locked > 0:
-                self._send_json({"ok": False, "error": f"尝试过多，已锁定，请 {int(locked//60)+1} 分钟后再试"}, 429)
-                return
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-            except Exception:
-                data = {}
-            pw = str(data.get("password", ""))
-            remember = bool(data.get("remember", False))
-            if not _verify_password(pw):
-                ip = self._client_ip()
-                cnt, _ = _login_fails.get(ip, (0, 0.0))
-                cnt += 1
-                lock_until = time.time() + LOGIN_LOCK_SEC if cnt >= LOGIN_LOCK_FAILS else 0.0
-                _login_fails[ip] = (cnt, lock_until)
-                time.sleep(min(0.2 * cnt, 1.0))   # 失败轻微延迟，增加爆破成本
-                self._send_json({"ok": False, "error": "密码错误"}, 401)
-                return
-            _login_fails.pop(self._client_ip(), None)
-            days = REMEMBER_DAYS if remember else SESSION_DAYS
-            tok = _make_session(days)
-            resp = {"ok": True}
-            if remember:
-                resp["token"] = tok   # 仅在勾选「记住本机」时把 token 返回前端存储
-            self._send_json(resp, extra_headers=self._set_session_cookie(tok, days=days))
-            return
-
-        if path == "/auto_login":
-            # 本机「记住我」静默续期：校验 localStorage 中的 Bearer token，成功则重发 Cookie
-            auth = self.headers.get("Authorization", "")
-            if auth.startswith("Bearer "):
-                tok = auth.split(" ", 1)[1].strip()
-                if _check_session(tok):
-                    self._send_json({"ok": True}, extra_headers=self._set_session_cookie(tok))
-                    return
-            self._send_json({"ok": False, "error": "invalid or expired token"}, 401)
-            return
-
-        if path == "/set_password":
-            if not self._authed():
-                self._send_json({"error": "unauthorized"}, 401)
-                return
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                data = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
-            except Exception:
-                data = {}
-            new_pw = str(data.get("new_password", ""))
-            if len(new_pw) < 6:
-                self._send_json({"ok": False, "error": "密码至少 6 位"}, 400)
-                return
-            _set_password(new_pw)
-            save_config()
-            self._send_json({"ok": True, "message": "密码已更新"})
-            return
-
-        if not self._authed():
-            self._send_json({"error": "unauthorized"}, 401)
-            return
-
         if path == "/config":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -1038,9 +761,9 @@ class Handler(BaseHTTPRequestHandler):
                 if "poll_interval" in data:
                     vals["poll_interval"] = max(1, int(data["poll_interval"]))
                 if "max_watch_min" in data:
-                    vals["max_watch_min"] = max(1, int(data["max_watch_min"]))
+                    vals["max_watch_min"] = _clamp_session_cap(data["max_watch_min"])
                 if "rest_min" in data:
-                    vals["rest_min"] = max(0, int(data["rest_min"]))
+                    vals["rest_min"] = _clamp_rest_base(data["rest_min"])
                 if "weekday_total_min" in data:
                     vals["weekday_total_min"] = max(0, int(data["weekday_total_min"]))
                 if "weekend_total_min" in data:
@@ -1104,10 +827,6 @@ class Handler(BaseHTTPRequestHandler):
                              "carry_min": val,
                              "daily_cap_min": guard.daily_cap_now()})
             return
-        elif path == "/reset_rest":
-            # 手动重置休息：净已看归零、清强制休息闸门，立即可看；不解除当日总时长封禁
-            guard.reset_rest()
-            self._send_json({"ok": True, "message": "已重置休息，可立即可看"})
         else:
             self._send_json({"error": "unknown path"}, 404)
 
@@ -1117,7 +836,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def monitor_loop():
     print(f"[{logts()}] 监控启动: TV={CONFIG['tv_ip']}:{CONFIG['tv_port']} "
-          f"最长观看={CONFIG['max_watch_min']}min 休息={CONFIG['rest_min']}min "
+          f"单次上限={CONFIG['max_watch_min']}min(硬顶{MAX_SESSION_MIN}) "
+          f"休息基准={CONFIG['rest_min']}min(刷新比例 {CONFIG['max_watch_min']}/{CONFIG['rest_min']}) "
+          f"无登录认证 "
           f"每日总时长(工作日/非工作日)={CONFIG['weekday_total_min']}/{CONFIG['weekend_total_min']}min "
           f"禁用时段={CONFIG['disabled_windows']} 轮询={CONFIG['poll_interval']}s")
     while True:
@@ -1131,7 +852,6 @@ def monitor_loop():
 
 def main():
     load_config()
-    _ensure_auth()
     refresh_urls()
     guard.load_state()   # 恢复今日观看时长（升级/重启不丢）
     ap = argparse.ArgumentParser(description="小米电视管控脚本 + 配置网页")
