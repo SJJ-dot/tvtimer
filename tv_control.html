@@ -22,7 +22,7 @@
     -webkit-text-size-adjust:100%;
   }
   .wrap{max-width:560px;margin:0 auto;padding:16px 14px 40px}
-  h1{font-size:20px;margin:6px 2px 14px;display:flex;align-items:center;gap:8px}
+  h1{font-size:20px;margin:6px 2px 8px;display:flex;align-items:center;gap:8px}
   h1 .dot{width:10px;height:10px;border-radius:50%;background:var(--blue)}
   .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
     padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(16,24,40,.04)}
@@ -90,7 +90,6 @@
 <body>
 <div class="wrap">
   <h1><span class="dot"></span>电视管控设置</h1>
-  <div class="hint" style="margin:-6px 2px 12px">规则：单次最多 30 分钟，到点关机；休息按比例刷新额度、随时可再开；当天另有总时长上限。</div>
 
   <div class="card">
     <h2 class="h-row">实时状态
@@ -112,7 +111,7 @@
       </div>
       <div class="track"><div class="fill" id="m-session-fill"></div></div>
       <div class="foot">
-        <span id="m-session-used">净已看 —</span>
+        <span id="m-session-used">已看 —</span>
         <span>上限 <b id="m-session-cap">30</b> 分</span>
       </div>
     </div>
@@ -380,7 +379,7 @@ async function poll(){
     $("stateIcon").textContent=icon;
     $("stateTitle").textContent=title;
 
-    /* 本次额度：净已看 + 还可看 恒等于上限，两者统一用秒级口径 */
+    /* 本次额度：已看(净) + 还可看 恒等于上限，两者统一用秒级口径 */
     const capSec=(s.max_watch_min||30)*60;
     const leftSec=s.watch_remaining_sec||0;
     const usedSec=(s.net_watched_sec!=null)?s.net_watched_sec:capSec-leftSec;
@@ -390,7 +389,7 @@ async function poll(){
       : `<small>还可看</small>${fmtSec(leftSec)}`;
     $("m-session-fill").style.width=pct(usedSec,capSec)+"%";
     $("m-session-fill").className="fill "+(noWatch?"bad":fillTone(leftSec/capSec));
-    $("m-session-used").textContent=`净已看 ${fmtSec(usedSec)}`;
+    $("m-session-used").textContent=`已看 ${fmtSec(usedSec)}`;
     $("m-session-cap").textContent=s.max_watch_min??30;
 
     /* 今日额度：毛观看，休息不会减少它 */

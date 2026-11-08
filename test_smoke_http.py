@@ -56,6 +56,8 @@ try:
     assert "已刷新" not in page and 'id="s-tip"' not in page, "状态卡片不应再有长说明文案"
     assert 'id="s-ip"' not in page and 'class="meta"' not in page, "状态卡片不应再有元信息标签行"
     assert "电视离线" not in page and "今日按" not in page, "在线状态/额度类型的重复标签应已删除"
+    assert "规则：单次最多" not in page, "顶部规则说明行应已删除"
+    assert "净已看" not in page, "本次额度条应显示「已看」而非「净已看」"
     code, _, body = req("/status")
     s = json.loads(body)
     assert code == 200 and "mode" in s, (code, body)
@@ -116,8 +118,8 @@ try:
         code, _, _ = req(p)
         assert code == 200, (p, code)
     code, _, body = req("/sw.js")
-    assert 'CACHE = "tvtimer-v6"' in body.decode(), "SW 缓存版本应升级"
-    print("6) PWA 静态资源公开 + SW tvtimer-v6 OK")
+    assert 'CACHE = "tvtimer-v7"' in body.decode(), "SW 缓存版本应升级"
+    print("6) PWA 静态资源公开 + SW tvtimer-v7 OK")
 
     # 7) 启动日志不再生成/打印随机密码
     with open(log_path, encoding="utf-8") as f:

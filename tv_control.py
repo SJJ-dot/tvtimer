@@ -644,7 +644,7 @@ MANIFEST = {
 }
 
 SW_JS = """\
-const CACHE = "tvtimer-v6";
+const CACHE = "tvtimer-v7";
 const SHELL = ["/manifest.webmanifest", "/icon.svg"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL).catch(() => {})).then(() => self.skipWaiting()));
